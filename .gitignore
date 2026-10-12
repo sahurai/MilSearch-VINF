@@ -1,0 +1,12 @@
+# Local virtual environment
+.venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Crawled pages, crawl state, parsed data, index and reports.
+# Large and reproducible with the commands in README.md.
+# Sample pages for the tests are in tests/fixtures/.
+data/

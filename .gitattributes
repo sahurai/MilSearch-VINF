@@ -1,0 +1,10 @@
+# Source, docs and config files use LF on every platform.
+* text=auto eol=lf
+
+# Shell scripts must keep LF, or bash cannot run them.
+*.sh text eol=lf
+
+# Test pages are byte-exact copies of the downloaded HTML. Git must not change them.
+tests/fixtures/pages/*.html -text
+
+*.png binary

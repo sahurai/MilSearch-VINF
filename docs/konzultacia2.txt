@@ -1,0 +1,179 @@
+====== MilSearch – 2. Konzultácia ======
+
+**Termín:** 14. 10. 2026 \\
+**Obsah:** frameworky, architektúra crawl systému, HTTP hlavičky a timeout/sleep, implementácia crawlera, ukážka stiahnutých stránok.
+
+===== 1. Použité frameworky a technológie =====
+
+^ Oblasť ^ Technológia ^ Na čo ^
+| Jazyk | **Python 3.11** | Celý projekt (crawler, extraktor, indexer). |
+| HTTP klient | **requests 2.x** (''requests.Session'') | Sťahovanie stránok, keep-alive spojenie, redirecty, gzip. |
+| Extrakcia odkazov a dát | **''re''** (štandardná knižnica) | Iba regulárne výrazy. Bez HTML parsera (BeautifulSoup, lxml) a bez XPath. |
+| robots.txt | ''urllib.robotparser'' (štandardná knižnica) | Kontrola, či URL je povolená, a hodnota ''Crawl-delay''. |
+| Úložisko | textové súbory: **HTML, JSONL, TSV** | Bez databázy. Frontier a metadáta sú append-only súbory. |
+| Deduplikácia | ''hashlib'' (SHA-1) | Rovnaký obsah na rôznych URL. |
+| 2. časť (plán) | **Apache Spark (PySpark)** | Spracovanie Wikipedia dumpu (EN/SK) a spojenie s dátami z MilitaryFactory. Beh v Docker image / na klastri UISAV. |
+| Indexer (plán, 2b) | **vlastný indexer** v Pythone | Invertovaný index, 2 metódy výpočtu idf (klasické idf a BM25 idf). |
+| Logovanie | ''logging'' (štandardná knižnica) | Formát: ''AKCIA objekt'' a páry ''kľúč=hodnota''. INFO: štart, priebeh, stop. DEBUG (''--verbose''): každá stránka. |
+| Testy | **pytest** | Unit testy (regex odkazy, extraktor) a integračné testy (frontier so súbormi). |
+
+Crawler je **vlastný**. Nepoužívam Scrapy ani iný crawl framework.
+
+===== 2. Architektúra crawl systému =====
+
+{{milsearch_crawler_architecture.png?direct&1100|Architektúra crawl systému MilSearch}}
+
+==== 2.1 Tok dát (krok za krokom) ====
+
+  - **Seed.** Crawler vloží do frontiera 3 úvodné stránky: ''/smallarms/index.php'', ''/armor/index.php'', ''/ships/index.php''.
+  - **Frontier.** Frontier vráti ďalšiu URL. Každá kategória má vlastnú FIFO frontu (prehľadávanie do šírky). Fronty sa striedajú (round-robin), preto všetky kategórie dostávajú stránky rovnomerne.
+  - **robots.txt.** Fetcher skontroluje, či robots.txt URL povoľuje.
+  - **Fetch.** Fetcher počká minimálne 2 s + náhodnú hodnotu 0–1 s od predchádzajúcej požiadavky. Potom pošle HTTP GET.
+  - **Deduplikácia.** Crawler porovná výslednú URL (po redirecte) a SHA-1 hash obsahu so stiahnutými stránkami.
+  - **Uloženie.** Crawler zapíše HTML do ''data/raw/<kategória>/<id>.html'' a záznam do ''fetched.jsonl''.
+  - **Odkazy.** Regex nájde všetky ''<a href>''. Crawler URL normalizuje a vyfiltruje. Nové URL zapíše do ''discovered.jsonl'' a vloží do frontiera. Anchor texty zapíše do ''anchors.tsv''.
+  - **Opakovanie.** Crawler pokračuje krokom 2, kým nie je frontier prázdny alebo kým nedosiahne limit (počet stránok, čas, hĺbka).
+
+Cesta po webe: ''index.php'' (hĺbka 0) → ''indexMAIN.php'' = celý A–Z katalóg (hĺbka 1) → ''detail.php?..._id=…'' (hĺbka 2) → odkazy medzi detailmi (hĺbka 3).
+
+==== 2.2 Pseudokód ====
+
+<code python>
+frontier = Frontier.load("discovered.jsonl", "fetched.jsonl")   # pokračovanie po prerušení
+frontier.add(SEEDS)
+while url := frontier.next():                     # BFS, round-robin cez kategórie
+    if not robots.can_fetch(UA, url): record(url, "blocked"); continue
+    wait_until(last_request + 2 s + random(0, 1 s))
+    response = GET(url, headers, timeout=(5, 20))  # retry 3x pri 429/5xx/timeout
+    if is_duplicate(response.final_url, sha1(response.body)):
+        record(url, "duplicate"); continue
+    save_html(response.body)
+    for link in regex_links(response.body):        # <a href="...">anchor</a>
+        url2 = normalize(link)                     # absolútna URL, https, bez #, .asp -> .php
+        if in_scope(url2) and depth < MAX_DEPTH:   # doména + regex index/indexMAIN/detail
+            frontier.add(url2)                     # iba ak URL ešte nepoznáme
+    record(url, "done")
+</code>
+
+==== 2.3 Obmedzenia (selection policy) ====
+
+  * **Doména:** iba ''www.militaryfactory.com''.
+  * **URL regex:** iba ''/(smallarms|armor|ships)/index.php'', ''/…/indexMAIN.php'' a ''/…/detail.php?(smallarms_id|armor_id|ship_id)=…''. Ostatné stránky (Aircraft, mapy, kalkulačky, reklamy) crawler nesťahuje.
+  * **MIME typ:** iba ''text/html''. Maximálna veľkosť stránky je 8 MB.
+  * **Hĺbka:** maximálne 3 odkazy od seed URL.
+  * **Dĺžka URL:** maximálne 300 znakov (ochrana proti crawler trap).
+  * **Počet stránok a čas:** voliteľne ''--max-pages'' a ''--max-minutes''.
+
+===== 3. HTTP hlavičky, timeout a sleep =====
+
+==== 3.1 Hlavičky ====
+
+^ Hlavička ^ Hodnota ^ Dôvod ^
+| ''User-Agent'' | ''MilSearchBot/0.1 (+academic search-engine project; FIIT STU Bratislava, course VINF)'' | Crawler sa slušne identifikuje. Nevydáva sa za prehliadač. |
+| ''Accept'' | ''text/html,application/xhtml+xml;q=0.9,*/*;q=0.5'' | Crawler chce iba HTML. |
+| ''Accept-Language'' | ''en-US,en;q=0.8'' | Anglický obsah. |
+| ''Accept-Encoding'' | ''gzip, deflate'' | Kompresia: menší prenos, menšia záťaž servera. |
+| ''Connection'' | ''keep-alive'' | Jedno TCP/TLS spojenie pre viac požiadaviek (''requests.Session''). |
+| ''Referer'' | URL stránky, na ktorej crawler odkaz našiel | Rovnaké správanie ako pri bežnom prechádzaní webu. |
+
+Overenie: server vracia ''200 OK'' aj pre User-Agent ''MilSearchBot''. Cloudflare ho neblokuje.
+
+==== 3.2 Timeout, sleep a opakovanie ====
+
+^ Parameter ^ Hodnota ^ Poznámka ^
+| Connect timeout | **5 s** | Maximálny čas na nadviazanie TCP/TLS spojenia. |
+| Read timeout | **20 s** | Maximálny čas medzi dvoma paketmi dát. Katalóg ''indexMAIN.php'' má približne 2 MB. |
+| Sleep medzi požiadavkami | **2 s + náhodne 0–1 s** | Jedno vlákno, jedna požiadavka naraz. V prednáške je dnes optimálne aj 1 s. Volím viac kvôli Cloudflare. |
+| Crawl-delay z robots.txt | použije sa, ak je väčší | robots.txt na MilitaryFactory teraz ''Crawl-delay'' nemá. |
+| Retry | **3x** | Pri HTTP 429, HTTP 5xx, timeoute a chybe spojenia. |
+| Backoff | **5 s → 10 s → 20 s** | Exponenciálny. Ak server pošle ''Retry-After'', crawler čaká dlhšie z dvoch hodnôt. |
+| Stop | **10 chýb za sebou** | Crawler sa zastaví (napr. blokovanie alebo výpadok servera). |
+
+==== 3.3 robots.txt ====
+
+''https://www.militaryfactory.com/robots.txt'' neobsahuje pravidlá ''Disallow''. Obsahuje iba Cloudflare //content signals// bez nastavených hodnôt. Signál ''search'' (budovanie vyhľadávacieho indexu) teda nie je obmedzený. Crawler robots.txt aj tak číta pri každom štarte.
+
+==== 3.4 Problémy, ktoré crawler rieši ====
+
+  * **Staré odkazy ''detail.asp''.** Server vracia ''301'' na ''detail.php''. Crawler ich normalizuje ešte pred vložením do frontiera.
+  * **Neplatné ID.** Napr. ''detail.php?smallarms_id=99999'' server presmeruje (''302'') na ''smallarms_id=1''. Crawler uloží stránku pod výslednou URL. Rovnakú stránku druhýkrát nesťahuje.
+  * **Rovnaký obsah na rôznych URL.** Kontrola SHA-1 hashu obsahu.
+  * **Prerušenie.** Stav je v append-only súboroch ''discovered.jsonl'' a ''fetched.jsonl''. Po ''Ctrl+C'' a novom spustení crawler pokračuje tam, kde skončil. Žiadne dáta sa nemažú.
+
+===== 4. Implementácia crawlera =====
+
+==== 4.1 Štruktúra projektu ====
+
+<code>
+MilSearch/
+├── crawler/
+│   ├── config.py      nastavenia: seed URL, hlavičky, timeouty, sleep, limity
+│   ├── crawl.py       hlavná slučka + príkazový riadok
+│   ├── frontier.py    URL fronta (BFS/FIFO, round-robin), stav v JSONL súboroch
+│   ├── fetcher.py     HTTP: robots.txt, sleep, timeout, retry, backoff
+│   ├── links.py       regex extrakcia odkazov, normalizácia URL, filter
+│   └── storage.py     ukladanie HTML a grafu odkazov
+├── extractor/
+│   ├── parse.py       regex extraktor (ukážka pre 2b)
+│   ├── countries.py   normalizácia názvov krajín
+│   └── stats.py       štatistika vyplnenia polí
+├── tests/
+│   ├── unit/          test_links.py, test_parse.py, test_countries.py, test_stats.py
+│   └── integration/   test_frontier.py
+├── data/
+│   ├── raw/{smallarms,armor,ships}/*.html
+│   ├── crawl/{discovered.jsonl, fetched.jsonl, anchors.tsv}
+│   └── parsed/{smallarms,armor,ships}.jsonl
+├── docs/
+│   ├── konzultacia2.txt
+│   └── diagrams/      crawler_architecture.html (zdroj), render.sh, *.png
+├── pytest.ini
+├── requirements.txt
+├── requirements-dev.txt
+└── README.md
+</code>
+
+==== 4.2 Regulárne výrazy pre odkazy (links.py) ====
+
+<code python>
+ANCHOR_RE  = re.compile(r"<a\s([^>]*)>(.*?)</a>", re.I | re.S)           # celý odkaz + anchor text
+HREF_RE    = re.compile(r"""href\s*=\s*["']([^"'#>]+)""", re.I)
+INDEX_RE   = re.compile(r"^/(smallarms|armor|ships)/index\.php$")
+CATALOG_RE = re.compile(r"^/(smallarms|armor|ships)/indexMAIN\.php$")
+DETAIL_RE  = re.compile(r"^/(smallarms|armor|ships)/detail\.php\?(smallarms_id|armor_id|ship_id)=([A-Za-z0-9._%-]+)$")
+</code>
+
+==== 4.3 Spustenie ====
+
+<code bash>
+python -m venv .venv                        # lokálne virtuálne prostredie projektu
+source .venv/Scripts/activate               # Windows Git Bash (Linux: .venv/bin/activate)
+python -m pip install -r requirements-dev.txt
+python -m crawler.crawl                    # celý crawl (dá sa prerušiť a znova spustiť)
+python -m crawler.crawl --max-pages 50      # iba 50 stránok
+python -m crawler.crawl --categories ships --max-minutes 30
+python -m extractor.parse                   # regex extrakcia -> data/parsed/*.jsonl
+python -m extractor.stats                   # štatistika vyplnenia polí
+</code>
+
+==== 4.4 Odhad rozsahu dát ====
+
+Počty pochádzajú z odkazov, ktoré crawler našiel v troch A–Z katalógoch (''discovered.jsonl'').
+
+^ Kategória ^ Detailné stránky v A–Z katalógu ^
+| Small Arms | 1 315 |
+| Armor (Vehicles & Artillery) | 1 263 |
+| Ships (Naval Warfare) | 1 134 |
+| **Spolu** | **3 712** |
+
+  * Priemerná veľkosť detailnej stránky je **82 KB** (min. 71 KB, max. 110 KB). A–Z katalóg má 1,7–1,9 MB.
+  * Celý crawl dá približne **3 712 × 82 KB + 5,4 MB ≈ 305 MB** HTML.
+  * Priemerný čas jednej požiadavky je 2,5 s (sleep + odozva servera ~120 ms). Celý crawl trvá približne **3 712 × 2,5 s ≈ 2,6 h**.
+  * Spolu s Wikipedia dumpom (EN ~90 GB rozbalený, SK 1,58 GB) projekt splní minimum 500 MB+ dát.
+
+
+===== 5. Ďalšie kroky (konzultácia 2b) =====
+
+  * Stiahnuť všetkých ~3 712 detailných stránok a pripraviť štatistiku (počet, veľkosť na disku).
+  * Dokončiť regex extraktor a ukážky dát na wiki.
+  * Vlastný indexer: invertovaný index, 2 metódy výpočtu idf (klasické ''log(N/df)'' a BM25 ''log((N − df + 0.5)/(df + 0.5) + 1)'').

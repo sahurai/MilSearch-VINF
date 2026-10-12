@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="sk">
+<head>
+<meta charset="utf-8">
+<title>MilSearch crawler architecture</title>
+<!-- Source of docs/diagrams/milsearch_crawler_architecture.png. Render: docs/diagrams/render.sh -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Kalam:wght@400;700&display=block" rel="stylesheet">
+<script src="https://unpkg.com/roughjs@4.6.6/bundled/rough.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #ffffff; }
+  svg { display: block; font-family: 'Kalam', cursive; }
+</style>
+</head>
+<body>
+<svg id="diagram" xmlns="http://www.w3.org/2000/svg" width="1640" height="900" viewBox="0 0 1640 900"></svg>
+<script>
+const SVG_NS = "http://www.w3.org/2000/svg";
+const svg = document.getElementById("diagram");
+const rc = rough.svg(svg, { options: { seed: 7, roughness: 1.1, strokeWidth: 1.6, bowing: 1 } });
+
+const COLORS = {
+  queue: "#ffd8a8",
+  compute: "#a5d8ff",
+  storage: "#b2f2bb",
+  external: "#e9ecef",
+  check: "#fcc2d7",
+  plan: "#d0bfff",
+  note: "#fff3bf",
+};
+const FILL = { fillStyle: "hachure", hachureGap: 7, fillWeight: 1.2 };
+
+// ---- Primitives ----------------------------------------------------------------
+function text(x, y, value, { size = 17, weight = 400, anchor = "middle", color = "#1e1e1e" } = {}) {
+  const element = document.createElementNS(SVG_NS, "text");
+  element.setAttribute("x", x);
+  element.setAttribute("y", y);
+  element.setAttribute("font-size", size);
+  element.setAttribute("font-weight", weight);
+  element.setAttribute("text-anchor", anchor);
+  element.setAttribute("fill", color);
+  element.textContent = value;
+  svg.appendChild(element);
+}
+
+function lines(cx, top, title, rows, { titleSize = 21, rowSize = 16.5, gap = 22 } = {}) {
+  text(cx, top, title, { size: titleSize, weight: 700 });
+  rows.forEach((row, index) => text(cx, top + 26 + index * gap, row, { size: rowSize }));
+}
+
+function box(x, y, w, h, fill, title, rows, options = {}) {
+  svg.appendChild(rc.rectangle(x, y, w, h, { fill, ...FILL, ...options }));
+  lines(x + w / 2, y + 32, title, rows);
+}
+
+function cylinder(x, y, w, h, fill, title, rows) {
+  const ry = 14;
+  svg.appendChild(rc.path(
+    `M ${x} ${y + ry} L ${x} ${y + h - ry} A ${w / 2} ${ry} 0 0 0 ${x + w} ${y + h - ry} L ${x + w} ${y + ry}`,
+    { fill, ...FILL },
+  ));
+  svg.appendChild(rc.ellipse(x + w / 2, y + ry, w, ry * 2, { fill, fillStyle: "solid" }));
+  lines(x + w / 2, y + ry * 2 + 26, title, rows, { titleSize: 19, rowSize: 15.5, gap: 20 });
+}
+
+function queue(x, y, w, h, fill, title, rows) {
+  svg.appendChild(rc.rectangle(x, y, w, h, { fill, ...FILL }));
+  lines(x + w / 2, y + 30, title, rows);
+  const slotCount = 6;
+  const slotWidth = 26;
+  const startX = x + (w - slotCount * slotWidth - (slotCount - 1) * 6) / 2;
+  for (let index = 0; index < slotCount; index += 1) {
+    svg.appendChild(rc.rectangle(startX + index * (slotWidth + 6), y + h - 38, slotWidth, 24,
+      { fill: "#ffffff", fillStyle: "solid" }));
+  }
+}
+
+function diamond(cx, cy, w, h, fill, title, rows) {
+  svg.appendChild(rc.polygon([[cx, cy - h / 2], [cx + w / 2, cy], [cx, cy + h / 2], [cx - w / 2, cy]],
+    { fill, ...FILL }));
+  lines(cx, cy - 6, title, rows, { titleSize: 18, rowSize: 15 });
+}
+
+function cloud(cx, cy, w, h, fill, title, rows) {
+  const left = cx - w / 2;
+  const top = cy - h / 2;
+  const d = [
+    `M ${left + w * 0.18} ${top + h * 0.85}`,
+    `C ${left - w * 0.05} ${top + h * 0.85}, ${left - w * 0.04} ${top + h * 0.42}, ${left + w * 0.16} ${top + h * 0.42}`,
+    `C ${left + w * 0.16} ${top + h * 0.05}, ${left + w * 0.5} ${top - h * 0.05}, ${left + w * 0.56} ${top + h * 0.22}`,
+    `C ${left + w * 0.7} ${top + h * 0.02}, ${left + w * 0.98} ${top + h * 0.12}, ${left + w * 0.9} ${top + h * 0.42}`,
+    `C ${left + w * 1.08} ${top + h * 0.5}, ${left + w * 1.04} ${top + h * 0.88}, ${left + w * 0.84} ${top + h * 0.85}`,
+    "Z",
+  ].join(" ");
+  svg.appendChild(rc.path(d, { fill, ...FILL }));
+  lines(cx, cy + 4, title, rows, { titleSize: 20, rowSize: 16 });
+}
+
+function arrow(points, { label = null, labelAt = null, dashed = false, anchor = "middle", both = false } = {}) {
+  const options = dashed ? { strokeLineDash: [8, 7], roughness: 0.8 } : { roughness: 0.8 };
+  svg.appendChild(rc.linearPath(points, options));
+  const head = (from, to) => {
+    const angle = Math.atan2(to[1] - from[1], to[0] - from[0]);
+    const size = 13;
+    const spread = Math.PI / 7;
+    svg.appendChild(rc.polygon([
+      to,
+      [to[0] - size * Math.cos(angle - spread), to[1] - size * Math.sin(angle - spread)],
+      [to[0] - size * Math.cos(angle + spread), to[1] - size * Math.sin(angle + spread)],
+    ], { fill: "#1e1e1e", fillStyle: "solid", roughness: 0.5 }));
+  };
+  head(points[points.length - 2], points[points.length - 1]);
+  if (both) head(points[1], points[0]);
+  if (label) {
+    const [lx, ly] = labelAt;
+    text(lx, ly, label, { size: 15.5, anchor, color: "#364fc7" });
+  }
+}
+
+// ---- Title ---------------------------------------------------------------------
+text(40, 52, "MilSearch – architektúra crawl systému", { size: 32, weight: 700, anchor: "start" });
+text(40, 80, "MilitaryFactory.com: Small Arms · Armor · Ships", { size: 18, anchor: "start", color: "#495057" });
+
+// ---- Crawl loop ----------------------------------------------------------------
+box(28, 140, 196, 92, COLORS.note, "Seed URLs", ["3× index.php", "smallarms · armor · ships"]);
+arrow([[224, 186], [276, 186]]);
+
+queue(278, 118, 212, 134, COLORS.queue, "URL Frontier", ["BFS · FIFO pre kategóriu", "round-robin"]);
+arrow([[490, 186], [598, 186]], { label: "ďalšia URL", labelAt: [544, 172] });
+
+box(600, 108, 252, 166, COLORS.compute, "Fetcher (crawler)", [
+  "robots.txt · User-Agent",
+  "sleep 2 s + 0–1 s jitter",
+  "timeout 5 s / 20 s",
+  "retry 3× · backoff 5/10/20 s",
+  "1 vlákno",
+]);
+
+cloud(1170, 192, 300, 160, COLORS.external, "militaryfactory.com", ["Cloudflare"]);
+arrow([[852, 160], [1026, 160]], { label: "HTTPS GET", labelAt: [939, 146] });
+arrow([[1026, 228], [852, 228]], { label: "HTML 200 / 301 / 302", labelAt: [939, 252] });
+
+// ---- Deduplication and storage -------------------------------------------------
+arrow([[726, 274], [726, 322]], { label: "HTML + final URL", labelAt: [738, 303], anchor: "start" });
+diamond(726, 384, 230, 124, COLORS.check, "Deduplikácia", ["final URL + SHA-1"]);
+
+cylinder(280, 318, 210, 136, COLORS.storage, "Crawl state", ["discovered.jsonl", "fetched.jsonl"]);
+arrow([[611, 384], [492, 384]], { label: "duplicita", labelAt: [552, 370] });
+arrow([[385, 254], [385, 316]], { dashed: true, both: true, label: "load / append", labelAt: [395, 291], anchor: "start" });
+
+cylinder(962, 318, 230, 136, COLORS.storage, "Raw HTML", ["data/raw/<kat>/<id>.html", "~82 KB / stránka"]);
+arrow([[841, 384], [960, 384]], { label: "nová stránka", labelAt: [900, 370] });
+
+// ---- Link extraction loop ------------------------------------------------------
+arrow([[726, 446], [726, 512]], { label: "nová stránka", labelAt: [738, 484], anchor: "start" });
+box(600, 514, 252, 140, COLORS.compute, "Link Extractor (regex)", [
+  "<a href> + anchor text",
+  "normalizácia URL",
+  "filter: doména · regex · hĺbka ≤ 3",
+]);
+arrow([[600, 584], [250, 584], [250, 222], [276, 222]], { label: "nové URL (v rozsahu)", labelAt: [425, 570] });
+
+cylinder(626, 712, 200, 116, COLORS.storage, "anchors.tsv", ["graf odkazov + anchor texty"]);
+arrow([[726, 654], [726, 710]]);
+
+// ---- Data extraction -----------------------------------------------------------
+arrow([[1077, 454], [1077, 512]]);
+box(962, 514, 230, 140, COLORS.compute, "Extractor (regex)", [
+  "názov · typ · krajina · rok",
+  "špecifikácie · výzbroj",
+  "operátori · text",
+]);
+arrow([[1077, 654], [1077, 710]]);
+cylinder(977, 712, 200, 116, COLORS.storage, "parsed/*.jsonl", ["štruktúrované dáta"]);
+
+// ---- Part 2 (plan) -------------------------------------------------------------
+svg.appendChild(rc.rectangle(1262, 300, 350, 572, { strokeLineDash: [10, 8], roughness: 0.9, stroke: "#7048e8" }));
+text(1437, 292, "2. časť (plán)", { size: 19, weight: 700, color: "#7048e8" });
+cylinder(1302, 330, 270, 106, COLORS.external, "Wikipedia dump", ["EN / SK (XML)"]);
+arrow([[1437, 436], [1437, 478]]);
+box(1302, 480, 270, 92, COLORS.plan, "Apache Spark", ["spojenie MF dát + Wikipédia"]);
+arrow([[1437, 572], [1437, 612]]);
+box(1302, 614, 270, 92, COLORS.plan, "Vlastný indexer", ["TF-IDF · BM25 (2× idf)"]);
+arrow([[1437, 706], [1437, 746]]);
+box(1302, 748, 270, 92, COLORS.plan, "Vyhľadávanie", ["otázky Q1–Q5"]);
+arrow([[1177, 770], [1232, 770], [1232, 526], [1300, 526]]);
+
+// ---- Legend --------------------------------------------------------------------
+const legend = [
+  [COLORS.queue, "fronta"],
+  [COLORS.compute, "spracovanie"],
+  [COLORS.storage, "súbory (bez DB)"],
+  [COLORS.check, "rozhodnutie"],
+  [COLORS.external, "externý zdroj"],
+  [COLORS.plan, "2. časť"],
+];
+text(40, 726, "Legenda", { size: 18, weight: 700, anchor: "start" });
+legend.forEach(([fill, label], index) => {
+  const y = 742 + index * 24;
+  svg.appendChild(rc.rectangle(40, y, 26, 18, { fill, fillStyle: "solid", roughness: 0.6 }));
+  text(76, y + 15, label, { size: 16, anchor: "start" });
+});
+</script>
+</body>
+</html>
