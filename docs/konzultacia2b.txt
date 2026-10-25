@@ -1,0 +1,103 @@
+====== MilSearch – Konzultácia 2b ======
+
+**Termín:** 28. 10. 2026 \\
+**Obsah:** dokončený crawler, všetky dáta a štatistika, regex extraktor s ukážkami, vlastný indexer s metódami idf, unit testy (bonus), tokeny tiktoken (bonus). \\
+**Podrobný report:** [[odovzdanie1|Odovzdanie 1. časti projektu]] (kód, tabuľky, porovnanie metód).
+
+===== 1. Dokončený crawler =====
+
+  * Crawl je hotový: **3 717 stránok, 100 % nájdených URL** (3 718 URL, jedna je redirect na už stiahnutú stránku).
+  * 0 chýb, 5 požiadaviek s retry, priemerná odozva servera 129 ms.
+  * Crawl prebehol 13. 10. 2026 (00:16 – 17:41) s jedným prerušením. Po prerušení pokračoval zo stavu v ''discovered.jsonl'' a ''fetched.jsonl''. Žiadna stránka sa nestiahla dvakrát.
+  * Nastavenia sa od konzultácie 2a nezmenili: ''MilSearchBot'' User-Agent, robots.txt, sleep 2 s + 0–1 s, timeout 5 s / 20 s, retry 3× s backoffom 5 → 10 → 20 s.
+
+===== 2. Dáta a štatistika =====
+
+^ Ukazovateľ ^ Small Arms ^ Armor ^ Ships ^ Spolu ^
+| Stiahnuté stránky | 1 316 | 1 265 | 1 136 | **3 717** |
+| z toho detailné (**relevantné**) | 1 314 | 1 263 | 1 134 | **3 711** (99,8 %) |
+| z toho navigácia (index + A–Z katalóg) | 2 | 2 | 2 | 6 |
+| Veľkosť HTML na disku | 99,2 MB | 100,5 MB | 87,9 MB | **287,5 MB** |
+| Priemerný detail | 75,7 KB | 79,9 KB | 77,8 KB | |
+| Tokeny textu – vlastný tokenizér | 745 013 | 928 787 | 882 943 | 2 556 743 |
+| Tokeny textu – tiktoken ''o200k_base'' (bonus) | 1 004 097 | 1 248 821 | 1 210 547 | **3 463 465** |
+| Tokeny textu – tiktoken ''cl100k_base'' (bonus) | 1 006 682 | 1 253 318 | 1 217 587 | 3 477 587 |
+| Tokeny HTML – tiktoken ''o200k_base'' (bonus) | 31 948 657 | 31 606 226 | 27 967 789 | 91 522 672 |
+
+Ďalšie súbory: extrahované dáta 22,9 MB, stav crawlu 8,3 MB, index 29,1 MB. Štatistiku vytvára ''python -m reports.corpus_stats''.
+
+Surové HTML má 26× viac tokenov ako vyextrahovaný text. Extrakcia teda odstráni približne 96 % šumu (navigácia, reklamy, skripty).
+
+V 2. časti pribudne Wikipedia dump (EN ~90 GB, SK 1,58 GB), takže projekt splní minimum 500 MB+.
+
+===== 3. Regex extraktor =====
+
+Súbor ''extractor/parse.py''. Iba regulárne výrazy, bez HTML parsera a bez XPath. Výstup: ''data/parsed/<kategória>.jsonl'' (3 711 dokumentov za 4 s).
+
+==== 3.1 Ukážky ====
+
+^ Pole ^ Barrett M82 ^ Leopard 2 ^ Type VII U-Boat ^ USS Nimitz (CVN-68) ^ Colt M16A2 ^
+| Typ | Anti-Tank / Anti-Material Rifle | Main Battle Tank (MBT) | Ocean-Going Diesel-Electric Attack Submarine | Nuclear-Powered Aircraft Carrier | Assault Rifle |
+| Krajina (originál) | United States | Germany | Germany (//Nazi Germany//) | United States | United States |
+| Rok | 1982 | 1979 | 1936 | 1975 | 1983 |
+| Výrobca | Barrett Firearms Company | Krauss-Maffei Wegmann; Krupp MaK | – | Newport News Shipbuilding | Colt Defense / …; FN Herstal |
+| Parametre | .50 BMG (12.7x99mm), 564 m, 853 m/s, 13,6 kg | 72 km/h, 550 km, 1 500 hp, 55,2 t | 769 t, 18 kts, 66,5 m, posádka 44 | 97 000 t, 30 kts, 332,8 m, dojazd neobmedzený | 5.56x45mm NATO, 600 m, 930 m/s, 3,58 kg |
+| Operátori | 56 krajín | 17 krajín | 6 krajín | United States | 61 krajín |
+| Varianty / lode v triede | 18 variantov | 24 variantov | 135 lodí | 10 lodí | 33 variantov |
+
+==== 3.2 Kvalita ====
+
+Nezávislá kontrola proti A–Z katalógu, ktorý má inú HTML šablónu (''python -m reports.extractor_eval''):
+
+^ Kategória ^ Porovnané ^ názov ^ typ ^ rok ^ krajina ^
+| smallarms | 1 314 | 100 % | 100 % | 100 % | 99,9 % |
+| armor | 1 263 | 100 % | 100 % | 100 % | 99,8 % |
+| ships | 1 134 | 100 % | 100 % | 100 % | 99,8 % |
+
+Opravy po kontrole na celých dátach:
+  * Krajina „Please Select“ (prázdne pole formulára na 4 stránkach lodí) → krajina sa vezme z jediného operátora.
+  * Preklep stránky „Untied States“ → United States.
+  * Lode používajú „Shipbuilder(s)“ namiesto „Contractor(s)“ → výrobca sa doplnil.
+
+Číselné hodnoty mimo prijateľného rozsahu (chyby na stránke) extraktor zmení na ''None'' a zapíše do ''implausible_fields''.
+
+===== 4. Vlastný indexer =====
+
+  * **Tokenizácia:** regex, malé písmená, bez diakritiky, stop slová, S-stemmer, zložené tokeny (''7.62x39'', ''t-80'') aj s ich časťami. Lematizácia nie je potrebná.
+  * **Index:** pozičný invertovaný index v textových súboroch. ''dictionary.tsv'' (term, df, offset) je v pamäti, ''postings.txt'' sa číta cez ''seek''.
+  * **TF** je vážený zónami: názov 3, typ/roly/krajina/kaliber/anchor texty 2, ostatné 1.
+  * **Veľkosť:** 3 711 dokumentov, 91 837 termov, 1 455 490 postingov, 29 MB.
+  * **Vytvorenie:** jedenkrát po extrakcii, jedným prechodom v pamäti (~10 s). Idf sa počíta pri dopyte z df, preto jeden index slúži všetkým metódam.
+  * **Dopyty:** voľný text, frázy (''"aircraft carrier"''), filtre (''country:germany'', ''year:1939..1945'', ''max_speed_kmh>70''), režim ''any''/''all''.
+
+===== 5. Metódy idf a porovnanie =====
+
+^ Metóda ^ Idf ^ Skóre ^
+| ''tfidf'' | ''log10(N / df)'' | kosínus (lnc.ltc) |
+| ''tfidf_smooth'' | ''log10(N / (1 + df)) + 1'' | kosínus (lnc.ltc) |
+| ''bm25'' | ''ln((N − df + 0.5) / (df + 0.5) + 1)'' | Okapi BM25 (k1 = 1.2, b = 0.75) |
+
+Pravdepodobnostné idf nepoužívam – zadanie ho zakazuje.
+
+Výsledky na 10 dopytoch (relevantné dokumenty určujú štruktúrované polia, nie textové vyhľadávanie):
+
+^ Metóda ^ MAP ^ P@10 ^ R@100 ^ nDCG@10 ^
+| ''tfidf'' | 0.475 | 0.550 | 0.835 | 0.605 |
+| ''tfidf_smooth'' | 0.462 | 0.530 | 0.831 | 0.580 |
+| ''bm25'' | **0.754** | **0.610** | **0.912** | **0.841** |
+
+  * Smooth idf dá častým slovám väčšiu váhu. V dopyte ''german submarine world war 2'' dostanú //world//, //war//, //2// 53 % váhy namiesto 19 % a AP klesne z 0.20 na 0.08.
+  * BM25 idf je takmer klasické idf × 2,3. Rozdiel ''bm25'' vs. ''tfidf'' preto spôsobuje saturácia tf a normalizácia dĺžky, nie idf.
+  * Tabuľky po dopytoch, top 5 a idf termov sú v [[odovzdanie1|reporte]] (kapitola 12).
+
+===== 6. Unit testy (bonus) =====
+
+  * **71 testov**, všetky prechádzajú (''python -m pytest''), bez prístupu na sieť.
+  * ''tests/unit/test_extractor_pages.py'': extraktor na **20 reálnych stránkach** (7 small arms, 7 armor, 6 ships) proti ručne overeným hodnotám.
+  * Ďalej testy regexov odkazov, normalizácie krajín, tokenizéra, parsera dopytov, vzorcov idf, BM25 a integračné testy frontiera a vyhľadávania.
+
+===== 7. Ďalšie kroky (konzultácia 3) =====
+
+  * Prechod extrakcie na Apache Spark (PySpark).
+  * Spracovanie Wikipedia dumpu (EN, SK): infoboxy, presmerovania, anchor texty.
+  * Spojenie s dátami z MilitaryFactory podľa názvu a alternatívnych názvov.

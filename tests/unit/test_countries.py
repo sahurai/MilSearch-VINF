@@ -98,3 +98,32 @@ def test_turkiye_and_diacritics_become_turkey() -> None:
     # 1. Normalize the spellings with and without diacritics
     assert get_canonical_country("Turkiye") == "Turkey"
     assert get_canonical_country("Türkiye") == "Turkey"
+
+
+def test_untied_states_typing_error_becomes_united_states() -> None:
+    """
+    Regression: three detail pages write "Untied States".
+
+    Steps:
+        1. Normalize the misspelled name.
+
+    Returns:
+        None.
+    """
+    # 1. Normalize the misspelled name
+    assert get_canonical_country("Untied States") == "United States"
+
+
+def test_form_placeholder_is_not_a_country() -> None:
+    """
+    Regression: four ship pages show the form placeholder "Please Select" as the country.
+
+    Steps:
+        1. Normalize the placeholder alone and in a list.
+
+    Returns:
+        None.
+    """
+    # 1. Normalize the placeholder alone and in a list
+    assert get_canonical_country("Please Select") is None
+    assert get_canonical_countries(["Please Select", "France"]) == ["France"]

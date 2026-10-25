@@ -3,17 +3,29 @@
 # ==============================================================================
 # PURPOSE:
 #     Compute the idf of a term and the score of a document for a query.
-#     Give three ranking methods that differ in the idf and in the length normalization.
+#     Give three ranking methods with three idf variants: classic, smooth and BM25.
+#     The course forbids the probabilistic idf, so MilSearch does not use it.
 #
 # RESPONSIBILITIES:
-#     1. Compute three idf variants: classic, probabilistic and BM25.
+#     1. Compute three idf variants: classic, smooth and BM25.
 #     2. Score documents in the vector space model (log tf, idf, cosine normalization).
 #     3. Score documents with Okapi BM25.
 #
+# METHODS:
+#     tfidf         vector model + classic idf
+#     tfidf_smooth  vector model + smooth idf   (only the idf is different from tfidf)
+#     bm25          Okapi BM25   + BM25 idf     (other idf, tf saturation and length normalization)
+#
 # FORMULAS:
-#     idf_classic(t)       = log10(N / df)
-#     idf_probabilistic(t) = max(0, log10((N - df) / df))
-#     idf_bm25(t)          = ln((N - df + 0.5) / (df + 0.5) + 1)
+#     idf_classic(t) = log10(N / df)                          (lecture 06, slide 48)
+#     idf_smooth(t)  = log10(N / (1 + df)) + 1                (tf-idf "idf smooth" variant)
+#         The "+ 1" outside the log gives frequent terms a weight near 1, not near 0.
+#         Thus frequent query words ("world", "war") keep a part of the query weight.
+#     idf_bm25(t)    = ln((N - df + 0.5) / (df + 0.5) + 1)    (lecture 06, slide 63, positive form)
+#         The "+ 1" keeps the value more than 0. Without it, a term in more than
+#         half of the documents gets a negative idf.
+#         Note: idf_bm25 = ln((N + 1) / (df + 0.5)). It is almost proportional to idf_classic
+#         (factor ln 10 = 2.3), so the terms of a query get the same shares of the weight.
 #
 #     Vector model (SMART lnc.ltc):
 #         w(t, d) = (1 + log10 tf(t, d)) / norm(d)
@@ -37,9 +49,9 @@ BM25_K1 = 1.2   # Standard value: tf saturates after a few occurrences.
 BM25_B = 0.75   # Standard value: partial length normalization.
 
 METHOD_TFIDF = "tfidf"
-METHOD_PROBABILISTIC = "probidf"
+METHOD_TFIDF_SMOOTH = "tfidf_smooth"
 METHOD_BM25 = "bm25"
-METHODS: tuple[str, ...] = (METHOD_TFIDF, METHOD_PROBABILISTIC, METHOD_BM25)
+METHODS: tuple[str, ...] = (METHOD_TFIDF, METHOD_TFIDF_SMOOTH, METHOD_BM25)
 
 
 # ==============================================================================
@@ -68,20 +80,18 @@ def compute_idf_classic(documents_count: int, df: int) -> float:
     return math.log10(documents_count / df) if df else 0.0
 
 
-def compute_idf_probabilistic(documents_count: int, df: int) -> float:
+def compute_idf_smooth(documents_count: int, df: int) -> float:
     """
-    Compute the probabilistic inverse document frequency.
+    Compute the smooth inverse document frequency.
 
     Steps:
-        1. Return max(0, log10((N - df) / df)); a term in half or more of the documents has idf 0.
+        1. Return log10(N / (1 + df)) + 1; a term without documents has idf 0.
 
     Returns:
-        Probabilistic idf, 0 or more.
+        Smooth idf; approximately 1 for a term in all documents.
     """
-    # 1. Return max(0, log10((N - df) / df)); a term in half or more of the documents has idf 0
-    if not df or df >= documents_count:
-        return 0.0
-    return max(0.0, math.log10((documents_count - df) / df))
+    # 1. Return log10(N / (1 + df)) + 1; a term without documents has idf 0
+    return math.log10(documents_count / (1 + df)) + 1 if df else 0.0
 
 
 def compute_idf_bm25(documents_count: int, df: int) -> float:
@@ -114,7 +124,7 @@ def get_idf_function(method: str) -> Callable[[int, int], float]:
     # 1. Look up the idf function by the method name
     functions = {
         METHOD_TFIDF: compute_idf_classic,
-        METHOD_PROBABILISTIC: compute_idf_probabilistic,
+        METHOD_TFIDF_SMOOTH: compute_idf_smooth,
         METHOD_BM25: compute_idf_bm25,
     }
     if method not in functions:

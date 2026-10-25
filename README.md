@@ -79,13 +79,15 @@ MilSearch/
 ├── indexer/
 │   ├── tokenizer.py   Terms from text: regex tokens, stop words, S-stemmer, compound tokens.
 │   ├── build.py       Builds the positional inverted index (dictionary, postings, documents).
-│   ├── ranking.py     Three idf variants, vector model (cosine) and BM25.
+│   ├── ranking.py     Three idf variants (classic, smooth, BM25), vector model (cosine) and BM25.
 │   ├── query.py       Query parser: free text, phrases, field filters.
 │   └── search.py      Search engine and command-line interface.
 ├── reports/
 │   ├── corpus_stats.py    Crawl, disk and token statistics (own tokenizer and tiktoken).
 │   ├── extractor_eval.py  Extractor accuracy against the A-Z catalog pages.
-│   └── search_eval.py     Comparison of the ranking methods (MAP, P@10, R@100, nDCG@10).
+│   └── search_eval.py     Comparison of the ranking methods (MAP, P@10, R@100, nDCG@10, idf of query terms).
+├── tools/
+│   └── build_zip.py       Makes the ZIP file with the source code for the wiki submission.
 ├── tests/
 │   ├── unit/          Tests of pure functions. No network.
 │   ├── integration/   Tests with files in a temporary directory (frontier, index and search).
@@ -94,7 +96,9 @@ MilSearch/
 ├── docs/
 │   ├── konzultacia2.txt   Wiki page for consultation 2a (DokuWiki syntax, Slovak).
 │   ├── konzultacia2b.txt  Wiki page for consultation 2b (DokuWiki syntax, Slovak).
+│   ├── odovzdanie1.txt    Wiki page for the submission of part 1: the full report (DokuWiki, Slovak).
 │   └── diagrams/          Architecture diagram: HTML source (rough.js), render script, PNG.
+├── dist/              Output of tools/build_zip.py (not in git).
 ├── pytest.ini
 ├── requirements.txt
 ├── requirements-dev.txt
@@ -198,6 +202,8 @@ The extractor reads `data/raw/<category>/*.html`. It writes one JSON object for 
 - States with more than one successor keep their names: Soviet Union, Czechoslovakia, Yugoslavia, Austria-Hungary.
 - Each numeric field has a plausible range. A value out of the range is an error on the site. The extractor sets it to `None` and writes the field name to `implausible_fields`.
 - A range "Essentially Unlimited" (nuclear ships) gives `range_km = None` and `is_range_unlimited = true`.
+- Some pages show the form placeholder "Please Select" in place of the country. The extractor sets `country_original = None`. If the page has exactly one operator country, `country` gets that country.
+- Ship pages give the manufacturer with the label "Shipbuilder(s)", the other pages with "Contractor(s)". Both go to `manufacturer`.
 
 ### 5.3 Extractor evaluation
 
@@ -246,9 +252,19 @@ The indexer gives a weight to each zone of a document. The tf of a term is the s
 
 | Method | idf | Score |
 |--------|-----|-------|
-| `tfidf` | `log10(N / df)` | Cosine similarity, SMART lnc.ltc: `(1 + log10 tf) / norm(d)` for the document, `(1 + log10 tf) * idf` for the query. |
-| `probidf` | `max(0, log10((N - df) / df))` | The same cosine similarity, with the probabilistic idf. |
-| `bm25` | `ln((N - df + 0.5) / (df + 0.5) + 1)` | Okapi BM25 with `k1 = 1.2`, `b = 0.75`. |
+| `tfidf` | classic: `log10(N / df)` | Cosine similarity, SMART lnc.ltc: `(1 + log10 tf) / norm(d)` for the document, `(1 + log10 tf) * idf` for the query. |
+| `tfidf_smooth` | smooth: `log10(N / (1 + df)) + 1` | The same cosine similarity. Only the idf is different from `tfidf`. |
+| `bm25` | BM25: `ln((N - df + 0.5) / (df + 0.5) + 1)` | Okapi BM25 with `k1 = 1.2`, `b = 0.75`. |
+
+The project does not use the probabilistic idf `log((N - df) / df)`. The course forbids it.
+
+Behavior of the idf variants:
+
+- The classic idf gives a term in all documents the weight 0.
+- The smooth idf gives frequent terms a weight near 1. Thus frequent query words ("world", "war") keep a part of the query weight.
+- The BM25 idf is equal to `ln((N + 1) / (df + 0.5))`. For rare terms, it is approximately 2.3 times the classic idf. Thus the terms of a query get the same shares of the weight as with the classic idf. The difference between `tfidf` and `bm25` comes from the tf saturation and the length normalization of BM25, not from the idf.
+
+The index stores tf and df only. The search engine computes the idf at query time, so one index serves all methods.
 
 ### 6.3 Query syntax
 
@@ -262,7 +278,7 @@ The indexer gives a weight to each zone of a document. The tf of a term is the s
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--method` | `bm25` | `tfidf`, `probidf`, `bm25` or `all` (results of the three methods). |
+| `--method` | `bm25` | `tfidf`, `tfidf_smooth`, `bm25` or `all` (results of the three methods). |
 | `--top` | 10 | Number of results. |
 | `--match` | `any` | `any`: documents with one or more query terms. `all`: documents with all query terms (intersection of the postings lists, the shortest list first). |
 
@@ -275,9 +291,40 @@ A query with only filters (for example `category:ships country:japan`) gives all
 | `python -m extractor.stats` | `data/parsed/coverage.*` | Number of documents with a value in each field. |
 | `python -m reports.corpus_stats` | `data/reports/corpus_stats.*` | Crawl results, size on disk, number of tokens (own tokenizer, tiktoken `o200k_base` and `cl100k_base`). Use `--skip-raw-tokens` to skip the slow count on the raw HTML. |
 | `python -m reports.extractor_eval` | `data/reports/extractor_eval.*` | Extractor accuracy against the catalog pages. |
-| `python -m reports.search_eval` | `data/reports/search_eval.*` | MAP, P@10, R@100 and nDCG@10 of the three ranking methods on 10 queries. The relevant documents come from the structured fields, not from the text search. |
+| `python -m reports.search_eval` | `data/reports/search_eval.*` | MAP, P@10, R@100 and nDCG@10 of the three ranking methods on 10 queries, the top 5 results, and the df and the three idf values of each query term. The relevant documents come from the structured fields, not from the text search. |
 
 Each report has a JSON file and a `.dokuwiki.txt` file with tables for the wiki.
+
+Run the full pipeline after a crawl in this order. Each step reads the output of the step before it:
+
+```bash
+python -m extractor.parse          # approx. 4 s
+python -m extractor.stats
+python -m indexer.build            # approx. 10 s
+python -m reports.extractor_eval
+python -m reports.search_eval
+python -m reports.corpus_stats     # approx. 60 s (tiktoken on the raw HTML)
+```
+
+### 7.1 Current results
+
+These values come from the full crawl of 13 October 2026.
+
+| Item | Value |
+|------|-------|
+| Downloaded pages | 3,717 (100 % of the discovered URLs; 0 failures; 5 retries) |
+| Relevant pages (detail pages) | 3,711: 1,314 small arms, 1,263 armor, 1,134 ships |
+| Raw HTML on disk | 287.5 MB |
+| Extracted documents | 3,711 (22.9 MB JSONL) |
+| Index | 91,837 terms, 1,455,490 postings, 2,474,694 positions, 29.1 MB |
+| Tokens of the extracted text | 2,556,743 (own tokenizer), 3,463,465 (tiktoken `o200k_base`) |
+| Extractor match with the A-Z catalogs | name, type, year 100 %; country 99.8–99.9 % |
+
+| Method | MAP | P@10 | R@100 | nDCG@10 |
+|--------|-----|------|-------|---------|
+| `tfidf` | 0.475 | 0.550 | 0.835 | 0.605 |
+| `tfidf_smooth` | 0.462 | 0.530 | 0.831 | 0.580 |
+| `bm25` | 0.754 | 0.610 | 0.912 | 0.841 |
 
 ## 8. Output files
 
@@ -360,7 +407,7 @@ The crawler identifies itself in the `User-Agent` header. It does not show itsel
    python -m pytest tests/integration
    ```
 
-The tests do not send HTTP requests. Each bug fix has a regression test. The test `tests/unit/test_extractor_pages.py` runs the extractor on 20 real pages (7 small arms, 7 armor, 6 ships) and compares the result with hand-checked values.
+The project has 71 tests. The tests do not send HTTP requests. Each bug fix has a regression test. The test `tests/unit/test_extractor_pages.py` runs the extractor on 20 real pages (7 small arms, 7 armor, 6 ships) and compares the result with hand-checked values.
 
 ## 11. Code conventions
 
@@ -378,3 +425,5 @@ The tests do not send HTTP requests. Each bug fix has a regression test. The tes
 - The extractor uses the HTML structure of MilitaryFactory.com. If the site changes its HTML, you must change the regular expressions in `extractor/parse.py`.
 - The indexer builds the index in memory in one pass. This is correct for approximately 3,700 documents. A much larger collection needs block-based indexing (BSBI or SPIMI with blocks on disk).
 - The S-stemmer only removes plural endings. It does not change verb forms.
+- Some fields exist only on some pages of the site: `total_production` only on armor pages, the shipbuilder only on 19 % of the ship pages, the muzzle velocity on 56 % of the small arms pages. The extractor cannot get values that the site does not show.
+- The cosine methods (`tfidf`, `tfidf_smooth`) put long articles lower. For example, `barrett m82` gives Barrett M82 at rank 5 with `tfidf` and at rank 1 with `bm25`. Thus `bm25` is the default method.

@@ -5,9 +5,10 @@
 #     Test the idf variants, the score functions and the postings intersection.
 #
 # RESPONSIBILITIES:
-#     1. Make sure that the three idf formulas give the values from the lecture example.
-#     2. Make sure that the vector model and BM25 rank the better document first.
-#     3. Make sure that the postings intersection is correct for sorted lists.
+#     1. Make sure that the three idf formulas give the expected values.
+#     2. Make sure that the methods do not use the probabilistic idf (the course forbids it).
+#     3. Make sure that the vector model and BM25 rank the better document first.
+#     4. Make sure that the postings intersection is correct for sorted lists.
 #
 # DEPENDENCIES:
 #     indexer.ranking — functions under test.
@@ -20,9 +21,14 @@ import math
 import pytest
 
 from indexer.ranking import (
+    METHOD_BM25,
+    METHOD_TFIDF,
+    METHOD_TFIDF_SMOOTH,
+    METHODS,
     compute_idf_bm25,
     compute_idf_classic,
-    compute_idf_probabilistic,
+    compute_idf_smooth,
+    get_idf_function,
     intersect_postings,
     score_bm25,
     score_vector_model,
@@ -55,20 +61,70 @@ def test_classic_idf_matches_lecture_example() -> None:
     assert compute_idf_classic(10_000, 0) == 0.0
 
 
-def test_probabilistic_idf_is_zero_for_frequent_terms() -> None:
+def test_methods_use_only_classic_and_bm25_idf() -> None:
     """
-    The probabilistic idf is log10((N - df) / df) and 0 for a term in half or more of the documents.
+    The course forbids the probabilistic idf. Each method uses the classic, smooth or BM25 idf.
 
     Steps:
-        1. Compute the probabilistic idf for a rare term and for frequent terms.
+        1. Get the idf function of each method.
 
     Returns:
         None.
     """
-    # 1. Compute the probabilistic idf for a rare term and for frequent terms
-    assert compute_idf_probabilistic(10_000, 50) == pytest.approx(math.log10(9_950 / 50))
-    assert compute_idf_probabilistic(10, 5) == 0.0
-    assert compute_idf_probabilistic(10, 8) == 0.0
+    # 1. Get the idf function of each method
+    assert METHODS == (METHOD_TFIDF, METHOD_TFIDF_SMOOTH, METHOD_BM25)
+    assert get_idf_function(METHOD_TFIDF) is compute_idf_classic
+    assert get_idf_function(METHOD_TFIDF_SMOOTH) is compute_idf_smooth
+    assert get_idf_function(METHOD_BM25) is compute_idf_bm25
+    with pytest.raises(ValueError):
+        get_idf_function("probidf")
+
+
+def test_classic_idf_is_zero_and_bm25_idf_positive_for_a_term_in_all_documents() -> None:
+    """
+    A term in all documents has classic idf 0, but a small positive BM25 idf.
+
+    Steps:
+        1. Compute both idf variants for df = N.
+
+    Returns:
+        None.
+    """
+    # 1. Compute both idf variants for df = N
+    assert compute_idf_classic(100, 100) == 0.0
+    assert 0 < compute_idf_bm25(100, 100) < 0.01
+
+
+def test_smooth_idf_keeps_frequent_terms_near_one() -> None:
+    """
+    The smooth idf is log10(N / (1 + df)) + 1: about 1 for a term in all documents.
+
+    Steps:
+        1. Compute the smooth idf for a rare term, a term in all documents and an unknown term.
+
+    Returns:
+        None.
+    """
+    # 1. Compute the smooth idf for a rare term, a term in all documents and an unknown term
+    assert compute_idf_smooth(10_000, 49) == pytest.approx(math.log10(200) + 1)
+    assert compute_idf_smooth(100, 100) == pytest.approx(1.0, abs=0.01)
+    assert compute_idf_smooth(100, 0) == 0.0
+
+
+def test_bm25_idf_is_almost_proportional_to_classic_idf() -> None:
+    """
+    idf_bm25 = ln((N + 1) / (df + 0.5)): for a rare term it is about ln(10) times the classic idf.
+
+    Steps:
+        1. Compare the ratio of the two idf values for rare terms.
+
+    Returns:
+        None.
+    """
+    # 1. Compare the ratio of the two idf values for rare terms
+    for df in (10, 50, 200):
+        ratio = compute_idf_bm25(100_000, df) / compute_idf_classic(100_000, df)
+        assert ratio == pytest.approx(math.log(10), rel=0.02)
 
 
 def test_bm25_idf_is_positive_for_all_terms() -> None:

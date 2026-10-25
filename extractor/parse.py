@@ -327,6 +327,7 @@ def extract_document(page: str, category: str, source_file: str) -> Document | N
         3. Map the site labels to MilSearch field names.
         4. Extract armament, variants, ships in class, roles, operators, manufacturer and site categories.
         5. Normalize the country of origin and the operator countries.
+           Without a country, use the only operator country.
         6. Compute the numeric fields and reject implausible values.
         7. Extract the body text.
 
@@ -380,7 +381,8 @@ def extract_document(page: str, category: str, source_file: str) -> Document | N
         html.unescape(unquote(nation)) for nation in _NATION_RE.findall(chunks.get("Operators", ""))
     })
     labeled_values = {label.strip(): _get_plain_text(value) for label, value in _LABELED_VALUE_RE.findall(page)}
-    document["manufacturer"] = labeled_values.get("Contractor(s)")
+    # Ship pages use the label "Shipbuilder(s)"; the other pages use "Contractor(s)".
+    document["manufacturer"] = labeled_values.get("Contractor(s)") or labeled_values.get("Shipbuilder(s)")
     document["total_production"] = _get_number(labeled_values.get("Total Production"))
     banners = _CONFLICT_BLOCK_RE.search(page)
     document["site_categories"] = _TITLE_ATTRIBUTE_RE.findall(banners.group(1)) if banners else []
@@ -389,6 +391,12 @@ def extract_document(page: str, category: str, source_file: str) -> Document | N
     document["country"] = get_canonical_country(document["country_original"])
     document["operators"] = get_canonical_countries(operators_original)
     document["operators_original"] = operators_original
+    if document["country"] is None:
+        # A placeholder such as "Please Select" is not a country name from the site.
+        document["country_original"] = None
+        if len(document["operators"]) == 1:
+            # The only operator is the best estimate of the country of origin.
+            document["country"] = document["operators"][0]
 
     # 6. Compute the numeric fields and reject implausible values
     document["implausible_fields"] = _compute_numeric_fields(document, category)

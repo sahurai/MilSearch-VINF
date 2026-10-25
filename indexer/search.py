@@ -10,7 +10,7 @@
 #     2. Read the postings list of a term from disk (seek by byte offset).
 #     3. Find candidates: union of the term postings (any) or their intersection (all).
 #     4. Keep only documents that contain each phrase (positional check) and match the filters.
-#     5. Rank the candidates with tf-idf, probabilistic idf or BM25.
+#     5. Rank the candidates with tf-idf (classic idf), tf-idf with smooth idf, or BM25.
 #     6. Show the results on the command line.
 #
 # DEPENDENCIES:

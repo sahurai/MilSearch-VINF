@@ -1,0 +1,570 @@
+====== MilSearch – Odovzdanie 1. časti projektu ======
+
+**Termín:** 28. 10. 2026 \\
+**Kód:** [[https://github.com/sahurai/MilSearch-VINF|GitHub – MilSearch-VINF]] · ZIP: {{MilSearch-VINF-part1.zip}} \\
+**Obsah 1. časti:** vlastný crawler, regex extraktor, vlastný indexer a vyhľadávač, 3 metódy idf, štatistiky, 71 unit testov.
+
+===== 1. Opis projektu a cieľ =====
+
+**MilSearch** je vyhľadávač vojenskej techniky. Pokrýva tri oblasti: ručné zbrane (pušky, pištole, guľomety), obrnenú techniku a delostrelectvo (tanky, obrnené vozidlá, húfnice) a vojnové lode a ponorky.
+
+**Motivácia.** Bežný fulltext nevie odpovedať na otázky ako „hlavné bojové tanky rýchlejšie ako 70 km/h“ alebo „nemecké ponorky z rokov 1939–1945“. Na to treba štruktúrované údaje: krajinu, rok, kaliber, rýchlosť, výtlak. MilSearch tieto údaje vyextrahuje z HTML a spojí fulltextový ranking s filtrami nad poľami.
+
+**Cieľ 1. časti:** vlastný crawler, extrakcia entít a parametrov regulárnymi výrazmi, vlastný invertovaný index, ranking a porovnanie metód idf. \\
+**Cieľ 2. časti:** spojenie s Wikipédiou (EN, SK) v Apache Spark a index v PyLucene.
+
+===== 2. Zdroje dát a extrahované údaje =====
+
+^ Zdroj ^ Úvodná stránka ^ Detailné stránky ^
+| MilitaryFactory – Infantry Small Arms | [[https://www.militaryfactory.com/smallarms/index.php]] | 1 314 |
+| MilitaryFactory – Vehicles & Artillery | [[https://www.militaryfactory.com/armor/index.php]] | 1 263 |
+| MilitaryFactory – Naval Warfare | [[https://www.militaryfactory.com/ships/index.php]] | 1 134 |
+
+Cesta crawlera: ''index.php'' → ''indexMAIN.php'' (celý A–Z katalóg) → ''detail.php?…_id=…'' → odkazy medzi detailmi.
+
+^ Skupina ^ Extrahované polia ^
+| Všetky kategórie | názov, typ, krajina pôvodu (kanonická + originál), rok, krátky opis, výrobca, výzbroj, varianty, roly, operátori (krajiny), kategórie konfliktov, všetky parametre (''specs''), text článku |
+| Ručné zbrane | kaliber, dĺžka, dĺžka hlavne, hmotnosť, účinný dostrel, úsťová rýchlosť, kadencia (čísla v mm, kg, m, m/s, ran/min) |
+| Obrnená technika | max. rýchlosť, dojazd, posádka, výkon motora, hmotnosť, rozmery, počet vyrobených kusov |
+| Lode | výtlak, dĺžka, šírka, ponor, rýchlosť (na hladine a pod hladinou), dojazd, posádka, lode v triede, lodenica |
+
+**Wikipédia (2. časť).** K dokumentom pripojím stránky ako [[https://en.wikipedia.org/wiki/Barrett_M82]], [[https://en.wikipedia.org/wiki/Leopard_2]], [[https://en.wikipedia.org/wiki/USS_Nimitz]] a [[https://sk.wikipedia.org/wiki/Leopard_2]]. Zaujímavé sú údaje z infoboxu (konštruktér, cena za kus, počet vyrobených kusov, vojny, roky v službe), presmerovania (alternatívne názvy) a anchor texty odkazov.
+
+==== 2.1 Ukážky extrahovaných údajov ====
+
+^ Pole ^ Colt M16A2 ^ Barrett M82 ^ Leopard 2 ^ Type VII U-Boat ^ USS Nimitz (CVN-68) ^
+| Kategória | smallarms | smallarms | armor | ships | ships |
+| Typ | Assault Rifle | Anti-Tank / Anti-Material Rifle | Main Battle Tank (MBT) | Ocean-Going Diesel-Electric Attack Submarine | Nuclear-Powered Aircraft Carrier |
+| Krajina (originál) | United States | United States | Germany | Germany (//Nazi Germany//) | United States |
+| Rok | 1983 | 1982 | 1979 | 1936 | 1975 |
+| Výrobca | Colt Defense / General Motors / H&R Firearms; FN Herstal | Barrett Firearms Company | Krauss-Maffei Wegmann; Krupp MaK | – | Newport News Shipbuilding |
+| Parametre | 5.56x45mm NATO, 600 m, 930 m/s, 3,58 kg | .50 BMG (12.7x99mm), 564 m, 853 m/s, 13,6 kg | 72 km/h, 550 km, 1 500 hp, 55,2 t, posádka 4 | 769 t, 18 kts, 66,5 m, posádka 44 | 97 000 t, 30 kts, 332,8 m, dojazd neobmedzený |
+| Roly | ASSAULT RIFLE, SPECIAL FORCES | ACCURACY/PRECISION, ANTI-TANK/MATERIAL | MAIN BATTLE TANK, TANK-vs-TANK | SUBMERGED ATTACK, MARITIME PATROL | FLAG / CAPITAL SHIP, SHIP-TO-SHORE |
+| Operátori | 61 krajín | 56 krajín | 17 krajín | 6 krajín | United States |
+| Varianty / lode v triede | 33 variantov | 18 variantov | 24 variantov | 135 lodí | 10 lodí |
+
+Ukážka jedného záznamu z ''data/parsed/smallarms.jsonl'' (skrátené):
+
+<code json>
+{"id": "smallarms-29", "category": "smallarms", "name": "Barrett M82",
+ "type": "Anti-Tank / Anti-Material Rifle (AMR)", "country": "United States",
+ "country_original": "United States", "year": 1982,
+ "manufacturer": "Barrett Firearms Company - USA", "caliber": ".50 BMG (12.7x99mm NATO)",
+ "effective_range_m": 563.9, "muzzle_velocity_mps": 853.0, "weight_kg": 13.6,
+ "roles": ["ACCURACY/PRECISION", "ANTI-TANK/MATERIAL", "SPECIAL FORCES"],
+ "operators": ["Albania", "Argentina", "Armenia", "Australia", "..."],
+ "variants": ["M82 - Base Designation", "M82A1 - \"Improved\" M82; redesigned muzzle brake.", "..."],
+ "url": "https://www.militaryfactory.com/smallarms/detail.php?smallarms_id=29"}
+</code>
+
+===== 3. Otázky a odpovede =====
+
+Odpovede sú skutočné výsledky ''python -m indexer.search "<dopyt>"'' (metóda BM25, top 5).
+
+^ # ^ Otázka ^ Dopyt v MilSearch ^ Odpoveď systému ^
+| 1 | Ktoré nemecké ponorky sú z 2. svetovej vojny? | ''submarine country:germany year:1939..1945'' | Type XXVII Seehund (1944), Biber (1944), Type XXI U-Boat (1944), Type XXIII U-Boat (1944), U-550 Type IXC/40 (1943) |
+| 2 | Ktoré útočné pušky strieľajú náboj 7,62×39 mm? | ''assault rifle caliber:7.62x39'' | CZ805 BREN, FEG AMP-69, Korobov TKB-059, BOF BD-08, FEG AKM-63 |
+| 3 | Ktoré hlavné bojové tanky sú rýchlejšie ako 70 km/h? | ''main battle tank max_speed_kmh>70'' | M60 Super/AX (72 km/h), Al Khalid (72), T-14 Armata (80), Rheinmetall KF51 Panther (105), AMX-56 Leclerc (71) |
+| 4 | Ktoré lietadlové lode majú výtlak nad 90 000 t? | ''aircraft carrier displacement_tons>90000'' | USS Gerald R. Ford (112 000 t), USS Enterprise (93 500 t), USS George H.W. Bush, USS Ronald Reagan, USS Dwight D. Eisenhower |
+| 5 | Kto vyrába Barrett M82, aký má kaliber a dostrel? | ''barrett m82'' | Barrett M82 na 1. mieste: Barrett Firearms Company, .50 BMG (12.7x99mm), 564 m |
+| 6 | Ktoré krajiny používajú tank Leopard 2? | ''"leopard 2"'' | Leopard 2 na 1. mieste, 17 operátorov: Austria, Canada, Chile, Denmark, Finland, Germany, Greece, Netherlands, Norway, Poland, Portugal, Singapore, Spain, Sweden, Switzerland, Turkey, Ukraine |
+
+===== 4. Frameworky a knižnice =====
+
+^ Technológia ^ Použitie ^ Prečo ^
+| **Python 3.11** | celý projekt | Rýchly vývoj, dobrá knižnica ''re'', neskôr PySpark v 2. časti. |
+| **requests** (''Session'') | HTTP | Keep-alive spojenie, gzip, redirecty, oddelený connect/read timeout. |
+| ''re'' (štandardná knižnica) | odkazy, extrakcia, tokenizácia | Zadanie vyžaduje regex. Bez HTML parsera (BeautifulSoup, lxml) a bez XPath. |
+| ''urllib.robotparser'' | robots.txt | Štandardná a overená implementácia pravidiel a ''Crawl-delay''. |
+| ''hashlib'' (SHA-1) | deduplikácia | Rovnaký obsah na rôznych URL (server presmeruje neplatné ID). |
+| ''json'', ''math'' | úložisko, ranking | JSONL a TSV súbory. Bez databázy (podľa zadania). |
+| **tiktoken** | štatistika | Počet tokenov (bonus). |
+| **pytest** | testy | 71 unit a integračných testov. |
+
+Nepoužívam Scrapy, Lucene, Whoosh ani databázu. Crawler, indexer aj ranking sú vlastné (podľa zadania).
+
+===== 5. Architektúra crawlera =====
+
+{{milsearch_crawler_architecture.png?direct&1100|Architektúra crawl systému MilSearch}}
+
+  - **Frontier** vráti ďalšiu URL. Každá kategória má vlastnú FIFO frontu (BFS). Fronty sa striedajú (round-robin).
+  - **Fetcher** skontroluje robots.txt, počká minimálne 2 s + 0–1 s a pošle GET (retry pri 429/5xx/timeoute).
+  - **Deduplikácia:** výsledná URL po redirecte a SHA-1 hash obsahu.
+  - **Úložisko:** HTML do ''data/raw/<kategória>/<id>.html'', záznam do ''fetched.jsonl''.
+  - **Odkazy:** regex nájde ''<a href>''. Crawler URL normalizuje a vyfiltruje. Nové URL zapíše do ''discovered.jsonl'', anchor texty do ''anchors.tsv''.
+  - **Obmedzenia:** iba ''www.militaryfactory.com'', iba 3 typy URL (regex), MIME ''text/html'', max. 8 MB, hĺbka 3, URL max. 300 znakov.
+  - **Prerušenie:** stav je v append-only súboroch. Po ''Ctrl+C'' crawler pokračuje tam, kde skončil. Nič sa nemaže.
+
+===== 6. Metadáta pri crawlovaní =====
+
+Crawler ukladá metadáta do troch append-only súborov. Používa ich na pokračovanie po prerušení, deduplikáciu, štatistiku a indexovanie anchor textov.
+
+**''data/crawl/fetched.jsonl''** – jeden riadok pre každý pokus o stiahnutie (3 717 riadkov):
+
+^ Pole ^ Ukážka (USS Nimitz) ^ Na čo ^
+| ''url'' | ''https://www.militaryfactory.com/ships/detail.php?ship_id=USS-Nimitz-CVN68'' | identifikácia stránky |
+| ''category'', ''kind'', ''depth'' | ''ships'', ''detail'', ''0'' | typ stránky a vzdialenosť od seedu |
+| ''fetched_at'' | ''2026-10-13T00:16:24'' | čas stiahnutia |
+| ''http_status'', ''final_url'' | ''200'', URL po redirecte | odhalenie presmerovaní (neplatné ID → 302) |
+| ''status'' | ''done'' (iné: ''duplicate'', ''failed'', ''blocked'') | stav pre frontier |
+| ''size_bytes'', ''sha1'' | ''78738'', ''8125908b1d635ccb03720818d47c9f580a361dfb'' | štatistika, deduplikácia obsahu |
+| ''elapsed_ms'', ''attempts_count'' | ''110'', ''1'' | odozva servera, počet pokusov (retry) |
+| ''file'' | ''data/raw/ships/ships-USS-Nimitz-CVN68.html'' | cesta k HTML |
+| ''links_count'', ''new_links_count'' | ''7'', ''0'' | počet odkazov v rozsahu / nových URL |
+
+**''data/crawl/discovered.jsonl''** – každá nová URL: ''{"url": "…/smallarms/index.php", "kind": "index", "category": "smallarms", "depth": 0, "parent_url": null}''
+
+**''data/crawl/anchors.tsv''** – graf odkazov (30 244 riadkov):
+
+^ Zdroj ^ Cieľ ^ Anchor text ^ title ^
+| ''…/armor/detail.php?armor_id=1'' | ''…/armor/detail.php?armor_id=289'' | ROTEM K2 (Black Panther) | History and details of the ROTEM K2 (Black Panther) … |
+
+===== 7. Hlavičky, timeouty a sleep – odôvodnenie =====
+
+^ Nastavenie ^ Hodnota ^ Dôvod ^
+| ''User-Agent'' | ''MilSearchBot/0.1 (+academic search-engine project; FIIT STU Bratislava, course VINF)'' | Crawler sa slušne identifikuje (prednáška 03). Nevydáva sa za prehliadač. Server ho neblokuje. |
+| ''Accept'' | ''text/html,application/xhtml+xml;q=0.9,*/*;q=0.5'' | Crawler chce iba HTML. |
+| ''Accept-Language'' | ''en-US,en;q=0.8'' | Anglický obsah. |
+| ''Accept-Encoding'' | ''gzip, deflate'' | Menší prenos, menšia záťaž servera. |
+| ''Connection'' | ''keep-alive'' | Jedno TCP/TLS spojenie pre všetky požiadavky. |
+| ''Referer'' | stránka s odkazom | Rovnaké správanie ako pri bežnom prechádzaní. |
+| Connect timeout | 5 s | TLS handshake na CDN trvá menej ako 1 s. |
+| Read timeout | 20 s | Najväčšia stránka (A–Z katalóg, ~2 MB) príde za menej ako 1 s. |
+| Sleep | 2 s + náhodne 0–1 s | Prednáška uvádza 1 s ako dnešné minimum. Volím viac kvôli Cloudflare, náhodná časť odstráni pravidelný rytmus. |
+| ''Crawl-delay'' | použije sa, ak je väčší | robots.txt na MilitaryFactory ho teraz nemá. |
+| Retry / backoff | 3× / 5 → 10 → 20 s, ''Retry-After'' má prednosť | Iba pri 429, 5xx, timeoute a chybe spojenia. |
+| Stop | 10 chýb za sebou | Ochrana pri blokovaní alebo výpadku servera. |
+
+Výsledok: 3 717 požiadaviek, 0 chýb, 5 požiadaviek s retry, priemerná odozva servera 129 ms.
+
+===== 8. Kód: extrakcia URL z HTML =====
+
+Súbor: [[https://github.com/sahurai/MilSearch-VINF/blob/main/crawler/links.py|crawler/links.py]]
+
+Regulárne výrazy ([[https://github.com/sahurai/MilSearch-VINF/blob/main/crawler/links.py#L35-L47|riadky 35–47]]):
+
+<code python>
+# Full <a ...>...</a> element. Group 1 is the attributes, group 2 is the inner HTML.
+_ANCHOR_RE = re.compile(r"<a\s([^>]*)>(.*?)</a>", re.IGNORECASE | re.DOTALL)
+_HREF_RE = re.compile(r"""href\s*=\s*["']([^"'#>]+)""", re.IGNORECASE)
+_TITLE_RE = re.compile(r"""title\s*=\s*["']([^"']*)""", re.IGNORECASE)
+_TAG_RE = re.compile(r"<[^>]+>")
+_SPACE_RE = re.compile(r"\s+")
+
+_CATEGORY_GROUP = "|".join(CATEGORIES)
+# The crawler downloads only these three page types.
+_INDEX_RE = re.compile(rf"^/({_CATEGORY_GROUP})/index\.php$")
+_CATALOG_RE = re.compile(rf"^/({_CATEGORY_GROUP})/indexMAIN\.php$")
+_DETAIL_RE = re.compile(
+    rf"^/({_CATEGORY_GROUP})/detail\.php\?(smallarms_id|armor_id|ship_id)=([A-Za-z0-9._%-]+)$"
+)
+</code>
+
+Normalizácia URL ([[https://github.com/sahurai/MilSearch-VINF/blob/main/crawler/links.py#L115-L142|riadky 115–142]]):
+
+<code python>
+def build_canonical_url(href: str, base_url: str) -> str | None:
+    """
+    Make a canonical absolute URL from a link.
+
+    Steps:
+        1. Resolve the link against the page URL.
+        2. Reject a scheme other than http/https and a different host.
+        3. Change the path suffix .asp to .php and remove the fragment.
+
+    Returns:
+        Canonical URL; None when the link goes out of the site.
+    """
+    # 1. Resolve the link against the page URL
+    parts = urlsplit(urljoin(base_url, html.unescape(href.strip())))
+
+    # 2. Reject a scheme other than http/https and a different host
+    if parts.scheme not in ("http", "https"):
+        return None
+    host = parts.netloc.lower()
+    if host == "militaryfactory.com":
+        host = ALLOWED_HOST
+    if host != ALLOWED_HOST:
+        return None
+
+    # 3. Change the path suffix .asp to .php and remove the fragment
+    # The server answers detail.asp with HTTP 301 to detail.php.
+    path = re.sub(r"\.asp$", ".php", parts.path)
+    return urlunsplit(("https", host, path, parts.query, ""))
+</code>
+
+Extrakcia odkazov s anchor textom ([[https://github.com/sahurai/MilSearch-VINF/blob/main/crawler/links.py#L169-L204|riadky 169–204]]):
+
+<code python>
+def extract_links(page_html: str, base_url: str) -> list[Link]:
+    """
+    Find all links of a page that are in the crawl scope.
+
+    Steps:
+        1. Find each <a> element and its href attribute.
+        2. Make the canonical URL and keep only URLs in the crawl scope.
+        3. Build a Link with the anchor text and the title attribute.
+
+    Returns:
+        Links in page order; the list can contain the same URL more than one time.
+    """
+    links: list[Link] = []
+
+    # 1. Find each <a> element and its href attribute
+    for attributes, inner_html in _ANCHOR_RE.findall(page_html):
+        href = _HREF_RE.search(attributes)
+        if not href:
+            continue
+
+        # 2. Make the canonical URL and keep only URLs in the crawl scope
+        url = build_canonical_url(href.group(1), base_url)
+        scope = get_url_scope(url) if url else None
+        if not scope:
+            continue
+
+        # 3. Build a Link with the anchor text and the title attribute
+        title = _TITLE_RE.search(attributes)
+        links.append(Link(
+            url=url,
+            kind=scope[0],
+            category=scope[1],
+            anchor_text=_get_plain_text(inner_html)[:_MAX_ANCHOR_TEXT_LENGTH],
+            title=html.unescape(title.group(1)) if title else "",
+        ))
+    return links
+</code>
+
+===== 9. Kód: extrakcia entít z HTML =====
+
+Súbor: [[https://github.com/sahurai/MilSearch-VINF/blob/main/extractor/parse.py|extractor/parse.py]]. Extraktor používa iba regulárne výrazy. Nepoužíva HTML parser, DOM ani XPath.
+
+Regulárne výrazy pre hlavičku, parametre, operátorov a roly ([[https://github.com/sahurai/MilSearch-VINF/blob/main/extractor/parse.py#L47-L72|riadky 47–72]]):
+
+<code python>
+_NAME_RE = re.compile(r'<h1 class="textJumbo"><span class="textBold">(.*?)</span></h1>', re.S)
+_TYPE_RE = re.compile(r'<h2 class="textLarge">(.*?)</h2>', re.S)
+# Example: <h3 class="textLarger textBold">United States | 1983</h3>
+_ORIGIN_RE = re.compile(r'<h3 class="textLarger textBold">\s*(.*?)\s*\|\s*([^<]*?)\s*</h3>', re.S)
+_QUOTE_RE = re.compile(r'<h4 class="textWhite textItalics textLarge">"?(.*?)"?</h4>', re.S)
+_CANONICAL_RE = re.compile(r'<link rel="canonical" href="([^"]+)"', re.I)
+</code>
+<code python>
+_SECTION_RE = re.compile(r'<span class="textJumbo textBold">([^<]+)</span>')
+_SPEC_BLOCK_RE = re.compile(r'<div class="specContainerMain[^"]*"[^>]*>(.*?)</div>', re.S)
+# An empty separator <div ...></div> inside a spec block stops _SPEC_BLOCK_RE too early.
+_EMPTY_DIV_RE = re.compile(r"<div[^>]*>\s*</div>")
+_SPAN_RE = re.compile(r"<span[^>]*>(.*?)</span>", re.S)
+_LABELED_VALUE_RE = re.compile(r'<span class="textBold">([^<:]+):</span>\s*([^<]+)</span>')
+_NATION_RE = re.compile(r'by-country\.php\?Nation=([^"&]+)"')
+_CONFLICT_BLOCK_RE = re.compile(r"<!--CONFLICTBANNERS-->(.*?)<!--CONFLICTBANNERS-->", re.S)
+_TITLE_ATTRIBUTE_RE = re.compile(r'title="([^"]+)"')
+# Role tags of the sections "Design Qualities" and "Mission Roles", for example "MAIN BATTLE TANK".
+_ROLE_RE = re.compile(r'<div class="roleContainers[^"]*">\s*([^<]+?)\s*</div>')
+</code>
+
+Číslo s jednotkou z textu, napr. ''"42 mph (67 kph)"'' → 67.0 km/h ([[https://github.com/sahurai/MilSearch-VINF/blob/main/extractor/parse.py#L212-L229|riadky 212–229]]):
+
+<code python>
+def _get_unit_number(value: str | None, unit_pattern: str | None) -> float | None:
+    """
+    Get the number in front of a unit, for example "42 mph (67 kph)" and r"kph\\b" -> 67.0.
+
+    Steps:
+        1. Without a unit pattern, get the first number.
+        2. With a unit pattern, find the number that the unit follows.
+
+    Returns:
+        Number; None when the text does not contain the number or the unit.
+    """
+    # 1. Without a unit pattern, get the first number
+    if unit_pattern is None:
+        return _get_number(value)
+
+    # 2. With a unit pattern, find the number that the unit follows
+    match = re.search(rf"(\d[\d.,]*)\s*(?:{unit_pattern})", value or "")
+    return _get_number(match.group(1)) if match else None
+</code>
+
+Hlavná funkcia ''extract_document'', kroky 1, 4 a 5 ([[https://github.com/sahurai/MilSearch-VINF/blob/main/extractor/parse.py#L320-L408|riadky 320–408]]):
+
+<code python>
+    # 1. Extract the title block
+    name = _get_first_match(_NAME_RE, page)
+    if not name:
+        return None
+    origin = _ORIGIN_RE.search(page)
+    year_text = _get_plain_text(origin.group(2)) if origin else ""
+    document: Document = {
+        "id": source_file.rsplit("/", 1)[-1].removesuffix(".html"),
+        "category": category,
+        "url": _get_first_match(_CANONICAL_RE, page),
+        "name": name,
+        "type": _get_first_match(_TYPE_RE, page),
+        "country_original": _get_plain_text(origin.group(1)) if origin else None,
+        "year": int(year_text) if year_text.isdigit() else None,
+        "summary": _get_first_match(_QUOTE_RE, page),
+    }
+</code>
+<code python>
+    document["roles"] = [html.unescape(role) for role in _ROLE_RE.findall(page)]
+    operators_original = sorted({
+        html.unescape(unquote(nation)) for nation in _NATION_RE.findall(chunks.get("Operators", ""))
+    })
+    labeled_values = {label.strip(): _get_plain_text(value) for label, value in _LABELED_VALUE_RE.findall(page)}
+    # Ship pages use the label "Shipbuilder(s)"; the other pages use "Contractor(s)".
+    document["manufacturer"] = labeled_values.get("Contractor(s)") or labeled_values.get("Shipbuilder(s)")
+    document["total_production"] = _get_number(labeled_values.get("Total Production"))
+    banners = _CONFLICT_BLOCK_RE.search(page)
+    document["site_categories"] = _TITLE_ATTRIBUTE_RE.findall(banners.group(1)) if banners else []
+
+    # 5. Normalize the country of origin and the operator countries
+    document["country"] = get_canonical_country(document["country_original"])
+    document["operators"] = get_canonical_countries(operators_original)
+    document["operators_original"] = operators_original
+    if document["country"] is None:
+        # A placeholder such as "Please Select" is not a country name from the site.
+        document["country_original"] = None
+        if len(document["operators"]) == 1:
+            # The only operator is the best estimate of the country of origin.
+            document["country"] = document["operators"][0]
+</code>
+
+**Kontrola kvality:**
+  * Každé číselné pole má prijateľný rozsah. Hodnota mimo rozsahu je chyba na stránke. Extraktor ju zmení na ''None'' a zapíše do ''implausible_fields''.
+  * Krajiny sa normalizujú: //Nazi Germany// → Germany, //Untied States// → United States. Štáty s viacerými nástupcami (Soviet Union, Czechoslovakia, Yugoslavia) ostávajú.
+  * Nezávislé overenie: A–Z katalóg má inú HTML šablónu a obsahuje názov, typ, rok a vlajku každého objektu. Zhoda s extraktorom je v tabuľke v kapitole 13.
+
+===== 10. Indexer a index (TF) =====
+
+Súbory: [[https://github.com/sahurai/MilSearch-VINF/blob/main/indexer/tokenizer.py|tokenizer.py]], [[https://github.com/sahurai/MilSearch-VINF/blob/main/indexer/build.py|build.py]], [[https://github.com/sahurai/MilSearch-VINF/blob/main/indexer/search.py|search.py]]
+
+**Tokenizácia** (rovnaká pre dokumenty aj dopyty):
+  * regex ''[a-z0-9]+(?:[.\-/][a-z0-9]+)*'', malé písmená, odstránenie diakritiky,
+  * zložené tokeny ostávajú celé a pridajú sa aj ich časti: ''t-80'' → ''t-80'', ''t'', ''80''; ''7.62x39mm'' → aj ''7.62x39'',
+  * krátky zoznam stop slov (slová ako //main//, //heavy//, //battle// ostávajú, sú dôležité v doméne),
+  * S-stemmer (Harman): odstráni iba množné číslo. Lematizáciu podľa zadania nerobím.
+
+**Zóny a TF.** Tf termu je súčet váh zón, v ktorých sa term nachádza:
+
+^ Zóna ^ Váha ^
+| ''name'' | 3 |
+| ''type'', ''roles'', ''country'', ''caliber'', anchor texty odkazov z iných detailov | 2 |
+| ostatné polia a text článku | 1 |
+
+<code python>
+def index_document(document: Document, anchor_texts: list[str]) -> dict[str, tuple[float, list[int]]]:
+    """
+    Change one document into weighted term frequencies and term positions.
+
+    Steps:
+        1. Go through the zones in a fixed order.
+        2. Add the zone weight to the tf of each term and keep the term position.
+        3. Leave a position gap after each zone.
+
+    Returns:
+        Map from term to (weighted tf, positions).
+    """
+    tf_by_term: dict[str, float] = defaultdict(float)
+    positions_by_term: dict[str, list[int]] = defaultdict(list)
+    position = 0
+
+    # 1. Go through the zones in a fixed order
+    for zone, weight in ZONE_WEIGHTS.items():
+        groups = get_term_groups(_get_zone_text(document, zone, anchor_texts))
+
+        # 2. Add the zone weight to the tf of each term and keep the term position
+        for group in groups:
+            for term in group:
+                tf_by_term[term] += weight
+                positions_by_term[term].append(position)
+            position += 1
+
+        # 3. Leave a position gap after each zone
+        position += _ZONE_POSITION_GAP
+    return {term: (tf_by_term[term], positions_by_term[term]) for term in tf_by_term}
+</code>
+
+**Súbory indexu** (''data/index/'', spolu 29 MB):
+
+^ Súbor ^ Obsah ^
+| ''dictionary.tsv'' | term, df, bajtový offset a dĺžka riadku v postings. Abecedne zoradený, vyhľadávač ho drží v pamäti. |
+| ''postings.txt'' | jeden riadok pre term: ''doc:tf:pozícia,pozícia;doc:tf:…'' (pozičný index pre frázy). Vyhľadávač číta riadok cez ''seek''. |
+| ''documents.jsonl'' | polia pre filtre a zobrazenie, dĺžka dokumentu, kosínusová norma. |
+| ''meta.json'' | N, počet termov a postingov, priemerná dĺžka, váhy zón. |
+
+**Veľkosť:** 3 711 dokumentov, 91 837 termov, 1 455 490 postingov, 2 474 694 pozícií.
+
+**Koľkokrát sa index vytvára:** jedenkrát po extrakcii, jedným prechodom v pamäti (približne 10 s). Index sa nemení inkrementálne. Po novej extrakcii sa celý vytvorí znova (''python -m indexer.build''). Normy dokumentov a priemerná dĺžka sa počítajú pri vytváraní, idf až pri dopyte z df v slovníku. Preto jeden index slúži všetkým trom metódam.
+
+**Vyhľadávanie:** zjednotenie postingov (''--match any'') alebo prienik od najkratšieho zoznamu (''--match all''), frázy cez pozície, filtre ''country:germany'', ''year:1939..1945'', ''max_speed_kmh>70''.
+
+===== 11. Metódy výpočtu idf =====
+
+Súbor: [[https://github.com/sahurai/MilSearch-VINF/blob/main/indexer/ranking.py|indexer/ranking.py]]. N = počet dokumentov, df = počet dokumentov s termom.
+
+^ Idf ^ Vzorec ^ Správanie ^
+| klasické | ''log10(N / df)'' | Prednáška 06. Term vo všetkých dokumentoch má idf 0. |
+| smooth | ''log10(N / (1 + df)) + 1'' | „+ 1“ mimo logaritmu: časté termy majú váhu okolo 1, nie 0. Rozdiely medzi termami sú menšie. |
+| BM25 | ''ln((N − df + 0.5) / (df + 0.5) + 1)'' | Prednáška 06 (BM25). „+ 1“ zabráni zápornej hodnote pre termy vo viac ako polovici dokumentov. |
+
+**Pravdepodobnostné idf** ''log((N − df) / df)'' **nepoužívam** – zadanie ho zakazuje.
+
+**Zistenie:** BM25 idf sa dá upraviť na ''ln((N + 1) / (df + 0.5))''. Pre zriedkavé termy je to takmer ''ln 10 × log10(N / df)'', teda klasické idf krát konštanta 2,3. Termy v dopyte preto dostanú rovnaký podiel váhy (tabuľka v kapitole 12). Rozdiel medzi ''tfidf'' a ''bm25'' teda nespôsobuje idf, ale saturácia tf a normalizácia dĺžky v BM25.
+
+**Metódy rankingu:**
+
+^ Metóda ^ Idf ^ Skóre ^
+| ''tfidf'' | klasické | kosínusová podobnosť, SMART lnc.ltc: dokument ''(1 + log10 tf) / norma'', dopyt ''(1 + log10 tf) × idf'' |
+| ''tfidf_smooth'' | smooth | rovnaká kosínusová podobnosť – líši sa iba idf |
+| ''bm25'' | BM25 | Okapi BM25, ''k1 = 1.2'', ''b = 0.75'' |
+
+<code python>
+def compute_idf_classic(documents_count: int, df: int) -> float:
+    """
+    Compute the classic inverse document frequency.
+
+    Steps:
+        1. Return log10(N / df); a term without documents has idf 0.
+
+    Returns:
+        Classic idf, 0 or more.
+    """
+    # 1. Return log10(N / df); a term without documents has idf 0
+    return math.log10(documents_count / df) if df else 0.0
+
+
+def compute_idf_smooth(documents_count: int, df: int) -> float:
+    """
+    Compute the smooth inverse document frequency.
+
+    Steps:
+        1. Return log10(N / (1 + df)) + 1; a term without documents has idf 0.
+
+    Returns:
+        Smooth idf; approximately 1 for a term in all documents.
+    """
+    # 1. Return log10(N / (1 + df)) + 1; a term without documents has idf 0
+    return math.log10(documents_count / (1 + df)) + 1 if df else 0.0
+
+
+def compute_idf_bm25(documents_count: int, df: int) -> float:
+    """
+    Compute the BM25 inverse document frequency (always positive).
+
+    Steps:
+        1. Return ln((N - df + 0.5) / (df + 0.5) + 1).
+
+    Returns:
+        BM25 idf, more than 0.
+    """
+    # 1. Return ln((N - df + 0.5) / (df + 0.5) + 1)
+    return math.log((documents_count - df + 0.5) / (df + 0.5) + 1)
+</code>
+
+===== 12. Porovnanie metód na dopytoch =====
+
+Relevantné dokumenty každého dopytu určujú štruktúrované polia (napr. ''type'' obsahuje „main battle tank“, ''country = Germany'' a rok 1935–1945), nie textové vyhľadávanie. Preto hodnotenie nezávisí od rankingu. Skript: ''python -m reports.search_eval'' (10 dopytov).
+
+^ Metóda ^ MAP ^ priemer P@10 ^ priemer R@100 ^ priemer nDCG@10 ^
+| ''tfidf'' | 0.475 | 0.550 | 0.835 | 0.605 |
+| ''tfidf_smooth'' | 0.462 | 0.530 | 0.831 | 0.580 |
+| ''bm25'' | **0.754** | **0.610** | **0.912** | **0.841** |
+
+^ Dopyt ^ Text ^ Relevantné ^ AP / P@10 ''tfidf'' ^ AP / P@10 ''tfidf_smooth'' ^ AP / P@10 ''bm25'' ^
+| Q1 | ''7.62x39 assault rifle'' | 35 | 0.85 / 1.0 | 0.83 / 0.9 | 0.93 / 1.0 |
+| Q2 | ''main battle tank'' | 83 | 0.74 / 0.8 | 0.72 / 0.8 | 0.99 / 1.0 |
+| Q3 | ''aircraft carrier'' | 117 | 0.80 / 1.0 | 0.80 / 1.0 | 0.91 / 1.0 |
+| Q4 | ''german submarine world war 2'' | 11 | 0.20 / 0.2 | 0.08 / 0.1 | 0.43 / 0.4 |
+| Q5 | ''barrett m82'' | 1 | 0.20 / 0.1 | 0.20 / 0.1 | 1.00 / 0.1 |
+| Q6 | ''soviet self-propelled howitzer'' | 3 | 0.22 / 0.1 | 0.23 / 0.1 | 0.53 / 0.2 |
+| Q7 | ''japanese battleship'' | 11 | 0.47 / 0.6 | 0.46 / 0.5 | 0.66 / 0.7 |
+| Q8 | ''british submachine gun'' | 3 | 0.10 / 0.1 | 0.12 / 0.1 | 0.92 / 0.3 |
+| Q9 | ''.50 bmg sniper rifle'' | 28 | 0.85 / 1.0 | 0.84 / 1.0 | 0.80 / 0.9 |
+| Q10 | ''american destroyer'' | 60 | 0.33 / 0.6 | 0.33 / 0.7 | 0.37 / 0.5 |
+
+**Top 5 pre tri dopyty** (✓ = relevantný):
+
+^ Dopyt ^ ''tfidf'' ^ ''tfidf_smooth'' ^ ''bm25'' ^
+| Q4 ''german submarine world war 2'' | Type XXVII Seehund ✓\\ HMS Royal Oak (08)\\ Barbarigo\\ HMS Upholder (P37)\\ Biber (Beaver) ✓ | HMS Royal Oak (08)\\ Type XXVII Seehund ✓\\ USS Wrangell (AE-12)\\ HMS Afridi (F07)\\ USS Nautilus (SS-168) | U-boat U-25 (Type IA) ✓\\ Type XXVII Seehund ✓\\ FS Surcouf\\ HMS Upholder (P37)\\ Type XXI U-Boat ✓ |
+| Q5 ''barrett m82'' | Barrett M95\\ Barrett M90\\ Barrett M107\\ Barrett XM109 OSW\\ Barrett M82 ✓ | Barrett M95\\ Barrett M90\\ Barrett M107\\ Barrett XM109 OSW\\ Barrett M82 ✓ | Barrett M82 ✓\\ Barrett M90\\ Barrett M95\\ Barrett M107\\ Barrett XM109 OSW |
+| Q8 ''british submachine gun'' | NORINCO Type 85\\ Lithgow F1 SMG\\ AUSTEN SMG\\ M3A1 (Grease Gun)\\ Labora Fontbernat M1938 | NORINCO Type 85\\ Lithgow F1 SMG\\ AUSTEN SMG\\ M3A1 (Grease Gun)\\ Labora Fontbernat M1938 | Sterling SMG (L2A1) ✓\\ Lanchester (SMG) ✓\\ Lithgow F1 SMG\\ STEN SMG ✓\\ AUSTEN SMG |
+
+**Idf termov dopytov** (N = 3 711; podiel = časť váhy dopytu, ktorú term dostane):
+
+^ Dopyt ^ Term ^ df ^ idf klasické ^ podiel ^ idf smooth ^ podiel ^ idf BM25 ^ podiel ^
+| Q4 | ''german'' | 1147 | 0.510 | 39% | 1.510 | 24% | 1.174 | 39% |
+| Q4 | ''submarine'' | 1061 | 0.544 | 42% | 1.543 | 24% | 1.252 | 42% |
+| Q4 | ''world'' | 3379 | 0.041 | 3% | 1.041 | 17% | 0.094 | 3% |
+| Q4 | ''war'' | 2915 | 0.105 | 8% | 1.105 | 18% | 0.242 | 8% |
+| Q4 | ''2'' | 2903 | 0.107 | 8% | 1.106 | 18% | 0.246 | 8% |
+| Q8 | ''british'' | 873 | 0.628 | 31% | 1.628 | 32% | 1.447 | 31% |
+| Q8 | ''submachine'' | 182 | 1.309 | 64% | 2.307 | 46% | 3.013 | 64% |
+| Q8 | ''gun'' | 2903 | 0.107 | 5% | 1.106 | 22% | 0.246 | 5% |
+
+**Vyhodnotenie:**
+  * **Klasické vs. smooth idf (Q4).** Klasické idf dá častým slovám //world//, //war//, //2// spolu iba 19 % váhy, smooth idf až 53 %. Tieto slová sú takmer v každom článku. Preto smooth idf vyzdvihne britské a americké lode z 2. svetovej vojny (HMS Royal Oak, USS Wrangell) a AP klesne z 0.20 na 0.08. Pri dopytoch bez častých slov (Q3, Q5) sú výsledky rovnaké.
+  * **BM25 idf vs. klasické idf.** Podiely termov sú rovnaké (pozri kapitolu 11). Samotné idf preto ranking nemení.
+  * **Kosínus vs. BM25 (Q5, Q8).** Kosínusová norma znevýhodní dlhé články. Barrett M82 má dlhý článok, preto je pri ''tfidf'' až 5. BM25 normalizuje dĺžku iba čiastočne (''b = 0.75'') a tf saturuje. Barrett M82 je pri BM25 prvý. V Q8 BM25 nájde Sterling, Lanchester a STEN, kosínus nenájde ani jeden britský samopal v top 5.
+  * BM25 je najlepší v 9 z 10 dopytov (MAP 0.754 vs. 0.475). Preto je predvolenou metódou vyhľadávača.
+
+===== 13. Štatistika vycrawlovaných dokumentov =====
+
+^ Ukazovateľ ^ Small Arms ^ Armor ^ Ships ^ Spolu ^
+| Nájdené URL (''discovered.jsonl'') | | | | 3 718 |
+| Stiahnuté stránky (status ''done'') | 1 316 | 1 265 | 1 136 | **3 717** (100 % URL, 1 redirect) |
+| z toho detailné stránky = **relevantné** | 1 314 | 1 263 | 1 134 | **3 711** (99,8 %) |
+| z toho navigácia (index + A–Z katalóg) | 2 | 2 | 2 | 6 |
+| Veľkosť HTML na disku | 99,2 MB | 100,5 MB | 87,9 MB | **287,5 MB** |
+| Priemer / min / max detailu | 75,7 / 62,9 / 111,2 KB | 79,9 / 66,4 / 151,9 KB | 77,8 / 66,1 / 123,5 KB | |
+| Extrahované dokumenty (''data/parsed'') | 1 314 | 1 263 | 1 134 | 3 711 (22,9 MB) |
+| Tokeny textu – vlastný tokenizér | 745 013 | 928 787 | 882 943 | 2 556 743 |
+| Tokeny textu – tiktoken ''o200k_base'' | 1 004 097 | 1 248 821 | 1 210 547 | **3 463 465** |
+| Tokeny textu – tiktoken ''cl100k_base'' | 1 006 682 | 1 253 318 | 1 217 587 | 3 477 587 |
+| Tokeny HTML – tiktoken ''o200k_base'' | 31 948 657 | 31 606 226 | 27 967 789 | 91 522 672 |
+
+Crawl trval od 13. 10. 2026 00:16 do 17:41 (s prerušením). Ďalšie súbory: stav crawlu 8,3 MB, index 29,1 MB.
+
+**Presnosť extraktora voči A–Z katalógu** (''python -m reports.extractor_eval''):
+
+^ Kategória ^ Porovnané ^ názov ^ typ ^ rok ^ krajina ^
+| smallarms | 1 314 | 100 % | 100 % | 100 % | 99,9 % |
+| armor | 1 263 | 100 % | 100 % | 100 % | 99,8 % |
+| ships | 1 134 | 100 % | 100 % | 100 % | 99,8 % |
+
+Zvyšné rozdiely v krajine nie sú chyby extraktora: objekt viacerých krajín (Czech Republic / Slovakia) alebo katalóg bez vlajky.
+
+**Vyplnenie hlavných polí** (''python -m extractor.stats''): kaliber 100 %, krajina 100 %, operátori 99 %, výtlak lodí 98 %, rýchlosť lodí 99 %, rýchlosť tankov 81 %, výkon motora 74 %. Chýbajúce hodnoty stránka neuvádza.
+
+**Objem dát.** Stránky z MilitaryFactory majú 287,5 MB. V 2. časti pribudne Wikipedia dump (EN ~90 GB rozbalený, SK 1,58 GB), takže projekt splní minimum 500 MB+.
+
+===== 14. ZIP s kódom =====
+
+{{MilSearch-VINF-part1.zip}} – zdrojový kód, testy, 20 testovacích stránok, dokumentácia. Bez stiahnutých dát (''data/'') a bez virtuálneho prostredia. Dáta sa dajú znova vytvoriť príkazmi:
+
+<code bash>
+python -m venv .venv && .venv\Scripts\activate
+python -m pip install -r requirements-dev.txt
+python -m crawler.crawl            # ~2,5 h, dá sa prerušiť a znova spustiť
+python -m extractor.parse          # 4 s
+python -m indexer.build            # 10 s
+python -m indexer.search "main battle tank max_speed_kmh>70" --method all --top 5
+python -m reports.search_eval      # porovnanie metód
+python -m reports.corpus_stats     # štatistika + tiktoken
+python -m pytest                   # 71 testov
+</code>
+
+===== Bonus: unit testy regex extraktorov =====
+
+Spolu **71 testov** (''python -m pytest'', všetky prechádzajú, bez prístupu na sieť).
+
+^ Súbor ^ Čo testuje ^
+| [[https://github.com/sahurai/MilSearch-VINF/blob/main/tests/unit/test_extractor_pages.py|tests/unit/test_extractor_pages.py]] | Extraktor na **20 reálnych stránkach** (7 small arms, 7 armor, 6 ships) proti ručne overeným hodnotám v ''tests/fixtures/expected_documents.json''. |
+| ''tests/unit/test_parse.py'' | Regexy hlavičky, parametrov, variantov, lodí v triede, rolí, výrobcu; nepravdepodobné hodnoty; „Please Select“ namiesto krajiny. |
+| ''tests/unit/test_links.py'' | Regex extrakcia odkazov, normalizácia URL, filter rozsahu. |
+| ''tests/unit/test_countries.py'' | Normalizácia krajín (historické štáty, preklepy stránky). |
+| ''tests/unit/test_tokenizer.py'', ''test_query.py'', ''test_ranking.py'' | Tokenizácia, parser dopytov, vzorce idf, kosínus, BM25, prienik postingov. |
+| ''tests/integration/'' | Frontier so súbormi, vytvorenie indexu a vyhľadávanie v dočasnom priečinku. |
+
+===== Bonus: počet tokenov =====
+
+Tabuľka v kapitole 13: vlastný tokenizér a tiktoken (''o200k_base'', ''cl100k_base'') pre čistý text aj pre surové HTML. Surové HTML má 26× viac tokenov ako čistý text (91,5 mil. vs. 3,5 mil.). Extrakcia teda odstráni približne 96 % šumu.

@@ -2,7 +2,7 @@
 # SEARCH EVALUATION — MilSearch
 # ==============================================================================
 # PURPOSE:
-#     Compare the three ranking methods on a fixed set of free-text queries.
+#     Compare the three ranking methods (tfidf, tfidf_smooth, bm25) on a fixed set of free-text queries.
 #     The relevant documents of each query come from the structured fields of the site,
 #     not from the ranked text search, so the judgment does not depend on the ranking.
 #
@@ -10,7 +10,8 @@
 #     1. Define the evaluation queries and their relevance rules.
 #     2. Find the relevant documents of each query in the document table.
 #     3. Rank the free-text query with each method and compute P@10, R@100, AP and nDCG@10.
-#     4. Write data/reports/search_eval.json and data/reports/search_eval.dokuwiki.txt.
+#     4. Show the df and the three idf values of each query term (behavior of the idf variants).
+#     5. Write data/reports/search_eval.json and data/reports/search_eval.dokuwiki.txt.
 #
 # DEPENDENCIES:
 #     indexer.ranking — method names.
@@ -25,6 +26,7 @@
 #     R@k     = relevant documents in the top k / all relevant documents
 #     AP      = (1 / |R|) * sum over relevant documents d in the ranking of P@rank(d)
 #     nDCG@k  = DCG@k / ideal DCG@k,  DCG@k = sum over i <= k of rel(i) / log2(i + 1)
+#     share   = idf(t) / sum of idf over the query terms  (part of the query weight that term t gets)
 #
 # INVARIANTS:
 #     The free-text query has no field filters; only the relevance rule uses the fields.
@@ -40,7 +42,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from indexer.ranking import METHODS
+from indexer.query import parse_query
+from indexer.ranking import METHODS, compute_idf_bm25, compute_idf_classic, compute_idf_smooth
 from indexer.search import SearchEngine
 from reports.corpus_stats import REPORTS_DIR
 
@@ -183,6 +186,40 @@ def compute_metrics(ranked_doc_ids: list[str], relevant_ids: set[str]) -> dict[s
     return {"p_at_10": p_at_10, "r_at_100": r_at_100, "ap": ap, "ndcg_at_10": dcg / ideal}
 
 
+def compute_idf_table(engine: SearchEngine, query_text: str) -> list[dict[str, Any]]:  # Any: term, counts, floats.
+    """
+    Compute the df and the classic, smooth and BM25 idf of each term of a query.
+
+    Steps:
+        1. Get the query terms with the same tokenizer as the index.
+        2. Read the df of each term from the dictionary and compute the three idf values.
+        3. Compute the share of each term in the sum of the idf values of the query.
+
+    Returns:
+        One row for each term: term, df, idf_<variant> and share_<variant> for classic, smooth and bm25.
+    """
+    # 1. Get the query terms with the same tokenizer as the index
+    parsed = parse_query(query_text)
+    terms = list(dict.fromkeys(parsed.terms + [term for phrase in parsed.phrases for term in phrase]))
+
+    # 2. Read the df of each term from the dictionary and compute the three idf values
+    documents_count = engine.meta["documents_count"]
+    rows: list[dict[str, Any]] = []  # Any: term, counts, floats.
+    for term in terms:
+        df = engine.dictionary.get(term, (0, 0, 0))[0]
+        rows.append({"term": term, "df": df,
+                     "idf_classic": compute_idf_classic(documents_count, df),
+                     "idf_smooth": compute_idf_smooth(documents_count, df),
+                     "idf_bm25": compute_idf_bm25(documents_count, df) if df else 0.0})
+
+    # 3. Compute the share of each term in the sum of the idf values of the query
+    for variant in ("classic", "smooth", "bm25"):
+        total = sum(row[f"idf_{variant}"] for row in rows) or 1.0
+        for row in rows:
+            row[f"share_{variant}"] = row[f"idf_{variant}"] / total
+    return rows
+
+
 def evaluate(engine: SearchEngine) -> dict[str, Any]:  # Any: nested metrics and top results.
     """
     Evaluate all queries with all methods.
@@ -200,7 +237,8 @@ def evaluate(engine: SearchEngine) -> dict[str, Any]:  # Any: nested metrics and
         # 1. Find the relevant documents of each query from the structured fields
         relevant_ids = {row["id"] for row in engine.rows if query.is_relevant(row)}
         result: dict[str, Any] = {"label": query.label, "text": query.text,  # Any: mixed values.
-                                  "relevant_count": len(relevant_ids), "methods": {}}
+                                  "relevant_count": len(relevant_ids), "methods": {},
+                                  "idf_terms": compute_idf_table(engine, query.text)}
 
         # 2. Rank each query with each method and compute the metrics; keep the top 5 names
         for method in METHODS:
@@ -232,6 +270,7 @@ def build_dokuwiki_report(report: dict[str, Any]) -> str:  # Any: nested metrics
         1. Write the table of mean metrics by method.
         2. Write the table of AP and P@10 for each query and method.
         3. Write the top 5 results of each query for each method.
+        4. Write the df and the three idf values of each query term.
 
     Returns:
         DokuWiki text.
@@ -253,6 +292,14 @@ def build_dokuwiki_report(report: dict[str, Any]) -> str:  # Any: nested metrics
     for query in report["queries"]:
         cells = ["\\\\ ".join(query["methods"][m]["top5"]) for m in METHODS]
         lines.append(f"| {query['label']} | " + " | ".join(cells) + " |")
+
+    # 4. Write the df and the three idf values of each query term
+    lines += ["", f"^ Dopyt ^ Term ^ df (N = {report['documents_count']}) ^ idf klasické ^ podiel ^ idf smooth ^ podiel ^ idf BM25 ^ podiel ^"]
+    for query in report["queries"]:
+        for row in query["idf_terms"]:
+            lines.append(f"| {query['label']} | ''{row['term']}'' | {row['df']} | {row['idf_classic']:.3f} "
+                         f"| {row['share_classic']:.0%} | {row['idf_smooth']:.3f} | {row['share_smooth']:.0%} "
+                         f"| {row['idf_bm25']:.3f} | {row['share_bm25']:.0%} |")
     return "\n".join(lines) + "\n"
 
 

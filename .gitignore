@@ -10,3 +10,6 @@ __pycache__/
 # Large and reproducible with the commands in README.md.
 # Sample pages for the tests are in tests/fixtures/.
 data/
+
+# Submission ZIP (python -m tools.build_zip)
+dist/

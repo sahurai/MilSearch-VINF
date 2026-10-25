@@ -8,6 +8,7 @@
 #     1. Make sure that the index files round-trip (dictionary offsets, postings, positions).
 #     2. Make sure that each ranking method puts the best document first.
 #     3. Make sure that phrases, "all" mode and filters limit the result.
+#     4. Make sure that the idf table of the search evaluation gives rare terms more weight.
 #
 # DEPENDENCIES:
 #     indexer.build — index builder.
@@ -23,6 +24,7 @@ import pytest
 from indexer.build import build_index, save_index
 from indexer.ranking import METHODS
 from indexer.search import MATCH_ALL, SearchEngine
+from reports.search_eval import compute_idf_table
 
 # ==============================================================================
 # CONSTANTS
@@ -84,6 +86,24 @@ def test_each_method_ranks_the_named_document_first(tmp_path: Path, method: str)
     hits = _build_engine(tmp_path).search("abrams tank", method=method)
     assert hits[0].row["name"] == "M1 Abrams"
     assert hits[0].score > 0
+
+
+def test_idf_table_gives_rare_terms_more_weight(tmp_path: Path) -> None:
+    """
+    In the idf table, a rare term has a higher idf and a larger share than a frequent term.
+
+    Steps:
+        1. Compute the idf table of "abrams tank" on the sample index.
+
+    Returns:
+        None.
+    """
+    # 1. Compute the idf table of "abrams tank" on the sample index
+    rows = {row["term"]: row for row in compute_idf_table(_build_engine(tmp_path), "abrams tank")}
+    assert rows["abram"]["df"] == 1
+    assert rows["tank"]["df"] == 2
+    assert rows["abram"]["idf_classic"] > rows["tank"]["idf_classic"] > 0
+    assert rows["abram"]["share_classic"] > rows["abram"]["share_smooth"] > 0.5
 
 
 def test_postings_round_trip_with_positions(tmp_path: Path) -> None:

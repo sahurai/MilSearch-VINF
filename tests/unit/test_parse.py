@@ -10,6 +10,8 @@
 #     3. Make sure that values with units in parentheses do not get double parentheses.
 #     4. Make sure that ships in class, roles, countries and numeric fields are correct.
 #     5. Make sure that an implausible numeric value from the site becomes None.
+#     6. Make sure that a form placeholder instead of the country falls back to the operator.
+#     7. Make sure that the ship manufacturer comes from the "Shipbuilder(s)" label.
 #
 # DEPENDENCIES:
 #     extractor.parse — functions under test.
@@ -196,3 +198,37 @@ def test_ships_in_class_roles_and_countries() -> None:
     assert document["country"] == "Germany"
     assert document["operators"] == ["Germany"]
     assert document["operators_original"] == ["Germany", "Nazi Germany"]
+
+
+def test_placeholder_country_falls_back_to_the_single_operator() -> None:
+    """
+    Regression: "Please Select" is not a country. With one operator country, the extractor uses it.
+
+    Steps:
+        1. Extract the sample ship page with the placeholder in the title block.
+
+    Returns:
+        None.
+    """
+    # 1. Extract the sample ship page with the placeholder in the title block
+    page = _SHIP_PAGE.replace("Nazi Germany | 1936", "Please Select | 1936")
+    document = extract_document(page, "ships", "data/raw/ships/ships-Type-VII-Uboat.html")
+    assert document["country_original"] is None
+    assert document["country"] == "Germany"
+    assert document["year"] == 1936
+
+
+def test_ship_manufacturer_comes_from_the_shipbuilder_label() -> None:
+    """
+    Regression: ship pages use the label "Shipbuilder(s)", other pages use "Contractor(s)".
+
+    Steps:
+        1. Extract the sample ship page with a shipbuilder line.
+
+    Returns:
+        None.
+    """
+    # 1. Extract the sample ship page with a shipbuilder line
+    page = _SHIP_PAGE + '<span class="textBold">Shipbuilder(s):</span> Newport News Shipbuilding - USA</span>'
+    document = extract_document(page, "ships", "data/raw/ships/ships-Type-VII-Uboat.html")
+    assert document["manufacturer"] == "Newport News Shipbuilding - USA"

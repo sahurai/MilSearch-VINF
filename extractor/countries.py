@@ -9,6 +9,7 @@
 #     1. Merge the historical names of a state that has one clear successor.
 #     2. Merge the spelling variants and the typing errors of the source site.
 #     3. Keep the names of states with more than one successor without change.
+#     4. Reject form placeholders of the site ("Please Select") that are not countries.
 #
 # INVARIANTS:
 #     The extractor keeps the original name in a separate field. Normalization does not lose data.
@@ -60,7 +61,11 @@ _CANONICAL_NAME_BY_KEY: dict[str, str] = {
     "turkiye": "Turkey",                 # Detail pages use "Turkiye"; catalogs and operators use "Turkey".
     # ---- Typing errors on the site ----
     "beliz": "Belize",
+    "untiedstates": "United States",
 }
+
+# Values that the site shows in place of a country, for example an empty form field.
+_PLACEHOLDER_KEYS: frozenset[str] = frozenset({"pleaseselect"})
 
 _KEY_RE = re.compile(r"[^a-z0-9]")
 _SPACE_RE = re.compile(r"\s+")
@@ -100,10 +105,11 @@ def get_canonical_country(name: str | None) -> str | None:
 
     Steps:
         1. Decode URL escapes, collapse whitespace and remove edge punctuation.
-        2. Replace a known alias with its canonical name.
+        2. Reject a form placeholder.
+        3. Replace a known alias with its canonical name.
 
     Returns:
-        Canonical name; None for an empty name.
+        Canonical name; None for an empty name or a placeholder.
     """
     # 1. Decode URL escapes, collapse whitespace and remove edge punctuation
     if not name:
@@ -112,8 +118,13 @@ def get_canonical_country(name: str | None) -> str | None:
     if not cleaned:
         return None
 
-    # 2. Replace a known alias with its canonical name
-    return _CANONICAL_NAME_BY_KEY.get(get_country_key(cleaned), cleaned)
+    # 2. Reject a form placeholder
+    key = get_country_key(cleaned)
+    if key in _PLACEHOLDER_KEYS:
+        return None
+
+    # 3. Replace a known alias with its canonical name
+    return _CANONICAL_NAME_BY_KEY.get(key, cleaned)
 
 
 def get_canonical_countries(names: Iterable[str]) -> list[str]:

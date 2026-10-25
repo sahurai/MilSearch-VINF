@@ -6,7 +6,7 @@
 #     Submodules:
 #         indexer.tokenizer — terms from text (regex tokens, stop words, S-stemmer).
 #         indexer.build     — builds the positional inverted index on disk.
-#         indexer.ranking   — idf variants and score functions (tf-idf, probabilistic idf, BM25).
+#         indexer.ranking   — idf variants and score functions (classic, smooth and BM25 idf; vector model, BM25).
 #         indexer.query     — query parser (free text, phrases, field filters).
 #         indexer.search    — loads the index and answers queries.
 #
