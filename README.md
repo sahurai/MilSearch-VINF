@@ -284,6 +284,8 @@ The index stores tf and df only. The search engine computes the idf at query tim
 
 A query with only filters (for example `category:ships country:japan`) gives all documents that match the filters.
 
+A filter on an unknown field (for example `colour:green`) or a missing index stops the command with a short error message and exit code 2.
+
 ## 7. Reports
 
 | Command | Output | Content |
@@ -304,6 +306,12 @@ python -m indexer.build            # approx. 10 s
 python -m reports.extractor_eval
 python -m reports.search_eval
 python -m reports.corpus_stats     # approx. 60 s (tiktoken on the raw HTML)
+```
+
+To make the ZIP file for the wiki submission (source code, tests and documentation; without `data/` and `.venv/`):
+
+```bash
+python -m tools.build_zip          # output: dist/MilSearch-VINF-part1.zip
 ```
 
 ### 7.1 Current results
@@ -407,7 +415,7 @@ The crawler identifies itself in the `User-Agent` header. It does not show itsel
    python -m pytest tests/integration
    ```
 
-The project has 71 tests. The tests do not send HTTP requests. Each bug fix has a regression test. The test `tests/unit/test_extractor_pages.py` runs the extractor on 20 real pages (7 small arms, 7 armor, 6 ships) and compares the result with hand-checked values.
+The project has 73 tests. The tests do not send HTTP requests. Each bug fix has a regression test. The test `tests/unit/test_extractor_pages.py` runs the extractor on 20 real pages (7 small arms, 7 armor, 6 ships) and compares the result with hand-checked values.
 
 ## 11. Code conventions
 

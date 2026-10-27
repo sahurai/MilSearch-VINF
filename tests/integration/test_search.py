@@ -8,7 +8,8 @@
 #     1. Make sure that the index files round-trip (dictionary offsets, postings, positions).
 #     2. Make sure that each ranking method puts the best document first.
 #     3. Make sure that phrases, "all" mode and filters limit the result.
-#     4. Make sure that the idf table of the search evaluation gives rare terms more weight.
+#     4. Make sure that the command line shows short errors, not tracebacks.
+#     5. Make sure that the idf table of the search evaluation gives rare terms more weight.
 #
 # DEPENDENCIES:
 #     indexer.build — index builder.
@@ -17,12 +18,14 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
 
 from indexer.build import build_index, save_index
 from indexer.ranking import METHODS
+import indexer.search as search_module
 from indexer.search import MATCH_ALL, SearchEngine
 from reports.search_eval import compute_idf_table
 
@@ -161,3 +164,52 @@ def test_unknown_filter_field_is_an_error(tmp_path: Path) -> None:
     # 1. Search with an unknown field
     with pytest.raises(ValueError):
         _build_engine(tmp_path).search("tank colour:green")
+
+
+def test_cli_shows_short_error_for_unknown_filter_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """
+    The command line stops with a usage error, not a traceback, for an unknown filter field.
+
+    Steps:
+        1. Make the command line use the sample index and an unknown field.
+        2. Run the command line and check the exit code and the message.
+
+    Returns:
+        None.
+    """
+    # 1. Make the command line use the sample index and an unknown field
+    engine = _build_engine(tmp_path)
+    monkeypatch.setattr(search_module, "SearchEngine", lambda: engine)
+    monkeypatch.setattr(sys, "argv", ["search", "tank colour:green"])
+
+    # 2. Run the command line and check the exit code and the message
+    with pytest.raises(SystemExit) as stop:
+        search_module.main()
+    assert stop.value.code == 2
+    assert "unknown filter field(s): colour" in capsys.readouterr().err
+
+
+def test_cli_shows_short_error_without_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """
+    The command line stops with a usage error, not a traceback, when the index files are missing.
+
+    Steps:
+        1. Make the command line open an empty directory.
+        2. Run the command line and check the exit code and the message.
+
+    Returns:
+        None.
+    """
+    # 1. Make the command line open an empty directory
+    monkeypatch.setattr(search_module, "SearchEngine", lambda: SearchEngine(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["search", "tank"])
+
+    # 2. Run the command line and check the exit code and the message
+    with pytest.raises(SystemExit) as stop:
+        search_module.main()
+    assert stop.value.code == 2
+    assert "python -m indexer.build" in capsys.readouterr().err

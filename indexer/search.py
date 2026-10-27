@@ -307,8 +307,9 @@ def main() -> None:
 
     Steps:
         1. Read the options and configure the logging (plain output lines).
-        2. Load the index.
-        3. Run the query with each selected method and show the results.
+        2. Load the index; stop with a short message when the index is missing.
+        3. Run the query with each selected method and show the results;
+           stop with a short message when the query has an unknown filter field.
 
     Returns:
         None.
@@ -322,13 +323,20 @@ def main() -> None:
     arguments = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    # 2. Load the index
-    engine = SearchEngine()
+    # 2. Load the index; stop with a short message when the index is missing
+    try:
+        engine = SearchEngine()
+    except FileNotFoundError:
+        parser.error(f"no index in {INDEX_DIR}; run 'python -m indexer.build' first")
 
-    # 3. Run the query with each selected method and show the results
+    # 3. Run the query with each selected method and show the results;
+    #    stop with a short message when the query has an unknown filter field
     methods = METHODS if arguments.method == "all" else (arguments.method,)
     for method in methods:
-        hits = engine.search(arguments.query, method=method, top=arguments.top, match_mode=arguments.match)
+        try:
+            hits = engine.search(arguments.query, method=method, top=arguments.top, match_mode=arguments.match)
+        except ValueError as error:
+            parser.error(str(error))
         logger.info("\n=== %s | query=%r | match=%s | results shown=%d", method, arguments.query, arguments.match, len(hits))
         for hit in hits:
             logger.info(_format_hit(hit))

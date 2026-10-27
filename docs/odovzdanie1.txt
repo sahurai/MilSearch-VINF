@@ -2,7 +2,7 @@
 
 **Termín:** 28. 10. 2026 \\
 **Kód:** [[https://github.com/sahurai/MilSearch-VINF|GitHub – MilSearch-VINF]] · ZIP: {{MilSearch-VINF-part1.zip}} \\
-**Obsah 1. časti:** vlastný crawler, regex extraktor, vlastný indexer a vyhľadávač, 3 metódy idf, štatistiky, 71 unit testov.
+**Obsah 1. časti:** vlastný crawler, regex extraktor, vlastný indexer a vyhľadávač, 3 metódy idf, štatistiky, 73 unit testov.
 
 ===== 1. Opis projektu a cieľ =====
 
@@ -79,7 +79,7 @@ Odpovede sú skutočné výsledky ''python -m indexer.search "<dopyt>"'' (metód
 | ''hashlib'' (SHA-1) | deduplikácia | Rovnaký obsah na rôznych URL (server presmeruje neplatné ID). |
 | ''json'', ''math'' | úložisko, ranking | JSONL a TSV súbory. Bez databázy (podľa zadania). |
 | **tiktoken** | štatistika | Počet tokenov (bonus). |
-| **pytest** | testy | 71 unit a integračných testov. |
+| **pytest** | testy | 73 unit a integračných testov. |
 
 Nepoužívam Scrapy, Lucene, Whoosh ani databázu. Crawler, indexer aj ranking sú vlastné (podľa zadania).
 
@@ -550,12 +550,12 @@ python -m indexer.build            # 10 s
 python -m indexer.search "main battle tank max_speed_kmh>70" --method all --top 5
 python -m reports.search_eval      # porovnanie metód
 python -m reports.corpus_stats     # štatistika + tiktoken
-python -m pytest                   # 71 testov
+python -m pytest                   # 73 testov
 </code>
 
 ===== Bonus: unit testy regex extraktorov =====
 
-Spolu **71 testov** (''python -m pytest'', všetky prechádzajú, bez prístupu na sieť).
+Spolu **73 testov** (''python -m pytest'', všetky prechádzajú, bez prístupu na sieť).
 
 ^ Súbor ^ Čo testuje ^
 | [[https://github.com/sahurai/MilSearch-VINF/blob/main/tests/unit/test_extractor_pages.py|tests/unit/test_extractor_pages.py]] | Extraktor na **20 reálnych stránkach** (7 small arms, 7 armor, 6 ships) proti ručne overeným hodnotám v ''tests/fixtures/expected_documents.json''. |
@@ -563,7 +563,7 @@ Spolu **71 testov** (''python -m pytest'', všetky prechádzajú, bez prístupu 
 | ''tests/unit/test_links.py'' | Regex extrakcia odkazov, normalizácia URL, filter rozsahu. |
 | ''tests/unit/test_countries.py'' | Normalizácia krajín (historické štáty, preklepy stránky). |
 | ''tests/unit/test_tokenizer.py'', ''test_query.py'', ''test_ranking.py'' | Tokenizácia, parser dopytov, vzorce idf, kosínus, BM25, prienik postingov. |
-| ''tests/integration/'' | Frontier so súbormi, vytvorenie indexu a vyhľadávanie v dočasnom priečinku. |
+| ''tests/integration/'' | Frontier so súbormi, vytvorenie indexu a vyhľadávanie v dočasnom priečinku, krátke chybové hlásenia CLI. |
 
 ===== Bonus: počet tokenov =====
 
