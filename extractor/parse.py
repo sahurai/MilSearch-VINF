@@ -19,20 +19,21 @@
 #     extractor.countries — canonical country names.
 #
 # USAGE:
-#     python -m extractor.parse
+#     python -m extractor.parse                       # sequential, Python 3.11
+#     python -m tools.spark extract_pages             # the same function in Spark (spark_jobs/extract_pages.py)
+#
+# INVARIANTS:
+#     Python 3.6 syntax. The Spark image of the course (iisas/hadoop-spark-pig-hive:2.9.2) has Python 3.6.
+#     The crawler modules need Python 3.10+, so main() imports them, not the module level.
 # ==============================================================================
-
-from __future__ import annotations
 
 import html
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Dict, FrozenSet, List, Optional, Pattern, Tuple
 from urllib.parse import unquote
 
-from crawler.config import CATEGORIES, PARSED_DIR, RAW_DIR
-from crawler.storage import get_relative_path
 from extractor.countries import get_canonical_countries, get_canonical_country
 
 # ==============================================================================
@@ -84,11 +85,11 @@ _NUMBER_RE = re.compile(r"-?\d[\d,]*\.?\d*")
 # Field mapping
 # ------------------------------------------------------------------------------
 # These sections do not contain data about the object.
-_SKIP_SECTIONS: frozenset[str] = frozenset({"Recognition", "Going Further..."})
-_ARMAMENT_SECTIONS: tuple[str, ...] = ("Armament", "Armament & Ammunition")
+_SKIP_SECTIONS: FrozenSet[str] = frozenset({"Recognition", "Going Further..."})
+_ARMAMENT_SECTIONS: Tuple[str, ...] = ("Armament", "Armament & Ammunition")
 
 # Label on MilitaryFactory -> field name in MilSearch.
-_FIELD_NAMES_BY_LABEL: dict[str, dict[str, str]] = {
+_FIELD_NAMES_BY_LABEL: Dict[str, Dict[str, str]] = {
     "smallarms": {
         "Caliber(s)": "caliber", "Muzzle Velocity": "muzzle_velocity",
         "Max.Eff.Range": "effective_range", "Weight": "weight", "Action": "action",
@@ -114,7 +115,7 @@ _FIELD_NAMES_BY_LABEL: dict[str, dict[str, str]] = {
 #  (minimum, maximum)). A value out of the range is an error on the site and becomes None.
 # The ranges are wide: they include the extreme real objects of each category.
 _HORSEPOWER_UNIT = r"(?:shaft\s+)?(?:horsepower|hp)\b"
-_NUMERIC_FIELDS: dict[str, tuple[tuple[str, str, str | None, tuple[float, float]], ...]] = {
+_NUMERIC_FIELDS: Dict[str, Tuple[Tuple[str, str, Optional[str], Tuple[float, float]], ...]] = {
     "smallarms": (
         ("length_mm", "length", r"mm\b", (50, 20_000)),                  # Pistol to heavy mortar.
         ("barrel_length_mm", "barrel_length", r"mm\b", (20, 15_000)),
@@ -152,8 +153,8 @@ _LIST_SEPARATOR_RE = re.compile(r"\s*;\s*")
 # TYPES
 # ==============================================================================
 
-Document = dict[str, Any]  # Any: a document holds str, int, float, list and dict values.
-SectionItem = dict[str, str | None]
+Document = Dict[str, Any]  # Any: a document holds str, int, float, list and dict values.
+SectionItem = Dict[str, Optional[str]]
 
 
 # ==============================================================================
@@ -179,7 +180,7 @@ def _get_plain_text(fragment: str) -> str:
     return "\n".join(line for line in lines if line)
 
 
-def _get_first_match(pattern: re.Pattern[str], page: str) -> str | None:
+def _get_first_match(pattern: Pattern[str], page: str) -> Optional[str]:
     """
     Get the plain text of group 1 of the first match.
 
@@ -194,7 +195,7 @@ def _get_first_match(pattern: re.Pattern[str], page: str) -> str | None:
     return _get_plain_text(match.group(1)) if match else None
 
 
-def _get_number(value: str | None) -> float | None:
+def _get_number(value: Optional[str]) -> Optional[float]:
     """
     Get the first number from a text such as "10,000 Units".
 
@@ -209,7 +210,7 @@ def _get_number(value: str | None) -> float | None:
     return float(match.group().replace(",", "")) if match else None
 
 
-def _get_unit_number(value: str | None, unit_pattern: str | None) -> float | None:
+def _get_unit_number(value: Optional[str], unit_pattern: Optional[str]) -> Optional[float]:
     """
     Get the number in front of a unit, for example "42 mph (67 kph)" and r"kph\\b" -> 67.0.
 
@@ -229,7 +230,7 @@ def _get_unit_number(value: str | None, unit_pattern: str | None) -> float | Non
     return _get_number(match.group(1)) if match else None
 
 
-def _compute_numeric_fields(document: Document, category: str) -> list[str]:
+def _compute_numeric_fields(document: Document, category: str) -> List[str]:
     """
     Add the numeric fields of a category to a document. Reject values out of the plausible range.
 
@@ -241,7 +242,7 @@ def _compute_numeric_fields(document: Document, category: str) -> list[str]:
     Returns:
         Names of the numeric fields with a rejected value.
     """
-    implausible_fields: list[str] = []
+    implausible_fields: List[str] = []
     for field_name, source_field, unit_pattern, (min_value, max_value) in _NUMERIC_FIELDS[category]:
         # 1. Get the number of each numeric field from its text field
         number = _get_unit_number(document.get(source_field), unit_pattern)
@@ -258,7 +259,7 @@ def _compute_numeric_fields(document: Document, category: str) -> list[str]:
     return implausible_fields
 
 
-def _build_section_item(block: str) -> SectionItem | None:
+def _build_section_item(block: str) -> Optional[SectionItem]:
     """
     Build one item from a spec block.
 
@@ -281,11 +282,26 @@ def _build_section_item(block: str) -> SectionItem | None:
     return None
 
 
+def get_document_id(source_file: str) -> str:
+    """
+    Get the document ID from the path of a page ("data/raw/armor/armor-1.html" -> "armor-1").
+
+    Steps:
+        1. Take the file name and remove the ".html" suffix.
+
+    Returns:
+        Document ID.
+    """
+    # 1. Take the file name and remove the ".html" suffix
+    file_name = source_file.replace("\\", "/").rsplit("/", 1)[-1]
+    return file_name[:-len(".html")] if file_name.endswith(".html") else file_name
+
+
 # ==============================================================================
 # MAIN LOGIC
 # ==============================================================================
 
-def extract_sections(page: str) -> tuple[dict[str, list[SectionItem]], dict[str, str]]:
+def extract_sections(page: str) -> Tuple[Dict[str, List[SectionItem]], Dict[str, str]]:
     """
     Cut a page at the section headings and extract the spec blocks of each section.
 
@@ -297,8 +313,8 @@ def extract_sections(page: str) -> tuple[dict[str, list[SectionItem]], dict[str,
     Returns:
         (items by section title, raw HTML by section title).
     """
-    sections: dict[str, list[SectionItem]] = {}
-    chunks: dict[str, str] = {}
+    sections: Dict[str, List[SectionItem]] = {}
+    chunks: Dict[str, str] = {}
 
     # 1. Find all section headings
     headings = list(_SECTION_RE.finditer(page))
@@ -317,7 +333,7 @@ def extract_sections(page: str) -> tuple[dict[str, list[SectionItem]], dict[str,
     return sections, chunks
 
 
-def extract_document(page: str, category: str, source_file: str) -> Document | None:
+def extract_document(page: str, category: str, source_file: str) -> Optional[Document]:
     """
     Extract one MilSearch document from a detail page.
 
@@ -341,7 +357,7 @@ def extract_document(page: str, category: str, source_file: str) -> Document | N
     origin = _ORIGIN_RE.search(page)
     year_text = _get_plain_text(origin.group(2)) if origin else ""
     document: Document = {
-        "id": source_file.rsplit("/", 1)[-1].removesuffix(".html"),
+        "id": get_document_id(source_file),
         "category": category,
         "url": _get_first_match(_CANONICAL_RE, page),
         "name": name,
@@ -424,6 +440,9 @@ def main() -> None:
         None.
     """
     # 1. Configure the logging and make the output directory
+    # The crawler modules need Python 3.10+. The Spark job (Python 3.6) imports only this module.
+    from crawler.config import CATEGORIES, PARSED_DIR, RAW_DIR
+    from crawler.storage import get_relative_path
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S")
     PARSED_DIR.mkdir(parents=True, exist_ok=True)
 

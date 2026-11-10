@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="sk">
+<head>
+<meta charset="utf-8">
+<title>MilSearch Spark pipeline</title>
+<!-- Source of docs/diagrams/milsearch_spark_pipeline.png. Render: docs/diagrams/render.sh -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Kalam:wght@400;700&display=block" rel="stylesheet">
+<script src="https://unpkg.com/roughjs@4.6.6/bundled/rough.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #ffffff; }
+  svg { display: block; font-family: 'Kalam', cursive; }
+</style>
+</head>
+<body>
+<svg id="diagram" xmlns="http://www.w3.org/2000/svg" width="1640" height="830" viewBox="0 0 1640 830"></svg>
+<script>
+const SVG_NS = "http://www.w3.org/2000/svg";
+const svg = document.getElementById("diagram");
+const rc = rough.svg(svg, { options: { seed: 7, roughness: 1.1, strokeWidth: 1.6, bowing: 1 } });
+
+const COLORS = {
+  queue: "#ffd8a8",
+  compute: "#a5d8ff",
+  storage: "#b2f2bb",
+  external: "#e9ecef",
+  check: "#fcc2d7",
+  plan: "#d0bfff",
+  note: "#fff3bf",
+};
+const FILL = { fillStyle: "hachure", hachureGap: 7, fillWeight: 1.2 };
+
+// ---- Primitives ----------------------------------------------------------------
+function text(x, y, value, { size = 17, weight = 400, anchor = "middle", color = "#1e1e1e" } = {}) {
+  const element = document.createElementNS(SVG_NS, "text");
+  element.setAttribute("x", x);
+  element.setAttribute("y", y);
+  element.setAttribute("font-size", size);
+  element.setAttribute("font-weight", weight);
+  element.setAttribute("text-anchor", anchor);
+  element.setAttribute("fill", color);
+  element.textContent = value;
+  svg.appendChild(element);
+}
+
+function lines(cx, top, title, rows, { titleSize = 21, rowSize = 16.5, gap = 22 } = {}) {
+  text(cx, top, title, { size: titleSize, weight: 700 });
+  rows.forEach((row, index) => text(cx, top + 26 + index * gap, row, { size: rowSize }));
+}
+
+function box(x, y, w, h, fill, title, rows, options = {}) {
+  svg.appendChild(rc.rectangle(x, y, w, h, { fill, ...FILL, ...options }));
+  lines(x + w / 2, y + 32, title, rows);
+}
+
+function cylinder(x, y, w, h, fill, title, rows) {
+  const ry = 14;
+  svg.appendChild(rc.path(
+    `M ${x} ${y + ry} L ${x} ${y + h - ry} A ${w / 2} ${ry} 0 0 0 ${x + w} ${y + h - ry} L ${x + w} ${y + ry}`,
+    { fill, ...FILL },
+  ));
+  svg.appendChild(rc.ellipse(x + w / 2, y + ry, w, ry * 2, { fill, fillStyle: "solid" }));
+  lines(x + w / 2, y + ry * 2 + 26, title, rows, { titleSize: 19, rowSize: 15.5, gap: 20 });
+}
+
+function queue(x, y, w, h, fill, title, rows) {
+  svg.appendChild(rc.rectangle(x, y, w, h, { fill, ...FILL }));
+  lines(x + w / 2, y + 30, title, rows);
+  const slotCount = 6;
+  const slotWidth = 26;
+  const startX = x + (w - slotCount * slotWidth - (slotCount - 1) * 6) / 2;
+  for (let index = 0; index < slotCount; index += 1) {
+    svg.appendChild(rc.rectangle(startX + index * (slotWidth + 6), y + h - 38, slotWidth, 24,
+      { fill: "#ffffff", fillStyle: "solid" }));
+  }
+}
+
+function diamond(cx, cy, w, h, fill, title, rows) {
+  svg.appendChild(rc.polygon([[cx, cy - h / 2], [cx + w / 2, cy], [cx, cy + h / 2], [cx - w / 2, cy]],
+    { fill, ...FILL }));
+  lines(cx, cy - 6, title, rows, { titleSize: 18, rowSize: 15 });
+}
+
+function cloud(cx, cy, w, h, fill, title, rows) {
+  const left = cx - w / 2;
+  const top = cy - h / 2;
+  const d = [
+    `M ${left + w * 0.18} ${top + h * 0.85}`,
+    `C ${left - w * 0.05} ${top + h * 0.85}, ${left - w * 0.04} ${top + h * 0.42}, ${left + w * 0.16} ${top + h * 0.42}`,
+    `C ${left + w * 0.16} ${top + h * 0.05}, ${left + w * 0.5} ${top - h * 0.05}, ${left + w * 0.56} ${top + h * 0.22}`,
+    `C ${left + w * 0.7} ${top + h * 0.02}, ${left + w * 0.98} ${top + h * 0.12}, ${left + w * 0.9} ${top + h * 0.42}`,
+    `C ${left + w * 1.08} ${top + h * 0.5}, ${left + w * 1.04} ${top + h * 0.88}, ${left + w * 0.84} ${top + h * 0.85}`,
+    "Z",
+  ].join(" ");
+  svg.appendChild(rc.path(d, { fill, ...FILL }));
+  lines(cx, cy + 4, title, rows, { titleSize: 20, rowSize: 16 });
+}
+
+function arrow(points, { label = null, labelAt = null, dashed = false, anchor = "middle", both = false } = {}) {
+  const options = dashed ? { strokeLineDash: [8, 7], roughness: 0.8 } : { roughness: 0.8 };
+  svg.appendChild(rc.linearPath(points, options));
+  const head = (from, to) => {
+    const angle = Math.atan2(to[1] - from[1], to[0] - from[0]);
+    const size = 13;
+    const spread = Math.PI / 7;
+    svg.appendChild(rc.polygon([
+      to,
+      [to[0] - size * Math.cos(angle - spread), to[1] - size * Math.sin(angle - spread)],
+      [to[0] - size * Math.cos(angle + spread), to[1] - size * Math.sin(angle + spread)],
+    ], { fill: "#1e1e1e", fillStyle: "solid", roughness: 0.5 }));
+  };
+  head(points[points.length - 2], points[points.length - 1]);
+  if (both) head(points[1], points[0]);
+  if (label) {
+    const [lx, ly] = labelAt;
+    text(lx, ly, label, { size: 15.5, anchor, color: "#364fc7" });
+  }
+}
+
+
+// ---- Title ---------------------------------------------------------------------
+text(40, 52, "MilSearch – spracovanie dát v Apache Spark (2. časť)", { size: 32, weight: 700, anchor: "start" });
+text(40, 80, "Docker iisas/hadoop-spark-pig-hive:2.9.2 · Spark 2.4.3 · Python 3.6 · spark-submit --master local[16] (na klastri yarn + hdfs://)",
+  { size: 18, anchor: "start", color: "#495057" });
+
+// ---- Inputs --------------------------------------------------------------------
+cylinder(40, 130, 230, 124, COLORS.external, "data/raw (1. časť)", ["3 717 HTML · 287 MB"]);
+cylinder(40, 300, 230, 124, COLORS.external, "EN Wikipedia dump", ["71 × bz2 · 25 GB"]);
+cylinder(40, 470, 230, 124, COLORS.external, "SK Wikipedia dump", ["bz2 0,36 GB", "+ langlinks.sql.gz"]);
+
+// ---- Spark jobs: extraction ----------------------------------------------------
+box(330, 122, 300, 140, COLORS.compute, "extract_pages", [
+  "wholeTextFiles → 64 partícií",
+  "regex extraktor z 1. časti",
+  "reduceByKey: štatistika",
+]);
+arrow([[270, 192], [328, 192]]);
+cylinder(690, 130, 230, 124, COLORS.storage, "spark/parsed", ["3 711 dokumentov", "JSON lines"]);
+arrow([[630, 192], [688, 192]]);
+
+box(330, 292, 300, 160, COLORS.compute, "wiki_pages", [
+  "text(lineSep=\"</page>\")",
+  "regexp_extract v JVM:",
+  "title · ns · id · redirect · text",
+  "1 bz2 súbor = 1 partícia",
+]);
+arrow([[270, 362], [328, 362]]);
+arrow([[270, 530], [300, 530], [300, 430], [328, 430]], { label: "--lang sk", labelAt: [306, 520], anchor: "start" });
+cylinder(690, 300, 230, 124, COLORS.storage, "wiki/en/pages", ["Parquet", "partitionBy(is_military)"]);
+arrow([[630, 362], [688, 362]]);
+cylinder(690, 470, 230, 124, COLORS.storage, "wiki/sk/pages", ["Parquet"]);
+arrow([[630, 430], [660, 430], [660, 530], [688, 530]]);
+
+// ---- Spark jobs: anchors and join ----------------------------------------------
+box(990, 280, 310, 210, COLORS.plan, "wiki_join", [
+  "kľúče názvov (varianty + rank)",
+  "equi-join kľúč → kandidáti",
+  "regex: infobox · kategórie · abstrakt",
+  "skóre: typ · rok · krajina · číslo lode",
+  "najlepšia stránka (skóre ≥ 8)",
+  "+ redirecty · anchor texty · SK",
+]);
+arrow([[920, 192], [1145, 192], [1145, 278]], { label: "dokumenty", labelAt: [1030, 178] });
+arrow([[920, 362], [988, 362]]);
+arrow([[920, 530], [952, 530], [952, 450], [988, 450]]);
+
+box(990, 600, 310, 150, COLORS.compute, "wiki_anchors", [
+  "split(text, \"[[\") → explode",
+  "presmerovania → cieľ",
+  "broadcast join · groupBy",
+]);
+arrow([[920, 400], [970, 400], [970, 675], [988, 675]]);
+arrow([[1145, 600], [1145, 492]], { label: "inlinky + anchor texty", labelAt: [1155, 560], anchor: "start" });
+
+// ---- Outputs -------------------------------------------------------------------
+cylinder(1370, 300, 240, 124, COLORS.storage, "wiki/joined.jsonl", ["dokument + EN + SK"]);
+arrow([[1300, 362], [1368, 362]]);
+box(1370, 488, 240, 100, COLORS.compute, "indexer.build --wiki", ["zóny: mená · abstrakt · vojny"]);
+arrow([[1490, 424], [1490, 486]]);
+box(1370, 640, 240, 100, COLORS.compute, "vyhľadávanie", ["katyusha · wiki_wars:vietnam"]);
+arrow([[1490, 588], [1490, 638]]);
+text(1490, 790, "data/reports/*.json · *.dokuwiki.txt", { size: 16, color: "#495057" });
+
+// ---- Legend --------------------------------------------------------------------
+const legend = [
+  [COLORS.external, "vstupné dáta"],
+  [COLORS.compute, "Spark úloha / Python"],
+  [COLORS.plan, "join (hlavná úloha)"],
+  [COLORS.storage, "súbory (bez DB)"],
+];
+text(40, 680, "Legenda", { size: 18, weight: 700, anchor: "start" });
+legend.forEach(([fill, label], index) => {
+  const y = 696 + index * 24;
+  svg.appendChild(rc.rectangle(40, y, 26, 18, { fill, fillStyle: "solid", roughness: 0.6 }));
+  text(76, y + 15, label, { size: 16, anchor: "start" });
+});
+</script>
+</body>
+</html>

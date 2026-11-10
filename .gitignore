@@ -13,3 +13,4 @@ data/
 
 # Submission ZIP (python -m tools.build_zip)
 dist/
+spark-warehouse/

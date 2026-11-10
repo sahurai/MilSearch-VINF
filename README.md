@@ -11,7 +11,9 @@ The data comes from two sources:
 1. HTML pages from [MilitaryFactory.com](https://www.militaryfactory.com). The MilSearch crawler downloads these pages.
 2. The Wikipedia dump (EN and SK). The second part of the project uses this dump.
 
-This document is about the first part of the project: the crawler, the regex extractor, the own inverted index with ranked search, and the statistics and evaluation reports.
+Part 1 of the project: the crawler, the regex extractor, the own inverted index with ranked search, and the statistics and evaluation reports (sections 4–12).
+
+Part 2 of the project: distributed processing in Apache Spark, the Wikipedia dump (EN and SK) and the join of the MilitaryFactory documents with Wikipedia (section 13).
 
 > Course: Information Retrieval (VINF), FIIT STU Bratislava, 2026.
 > The documentation in this repository uses ASD-STE100 Simplified Technical English.
@@ -31,6 +33,12 @@ The crawler, the extractor and the indexer do not use other libraries. They use 
 The project does not use a database. It keeps all data in text files (HTML, JSONL, TSV, plain-text index files).
 
 For the tests, you also need pytest 8.0 or higher (`requirements-dev.txt`).
+
+For the Spark jobs (part 2), you also need Docker and the image of the course `iisas/hadoop-spark-pig-hive:2.9.2` (Spark 2.4.3, Python 3.6.9, Java 8). The Spark jobs and the modules that they use (`extractor/parse.py`, `extractor/countries.py`, `wiki/`, `spark_jobs/`) use Python 3.6 syntax, so that they run in this image and on the cluster of the course.
+
+```bash
+docker pull iisas/hadoop-spark-pig-hive:2.9.2
+```
 
 ## 2. Installation
 
@@ -82,12 +90,24 @@ MilSearch/
 │   ├── ranking.py     Three idf variants (classic, smooth, BM25), vector model (cosine) and BM25.
 │   ├── query.py       Query parser: free text, phrases, field filters.
 │   └── search.py      Search engine and command-line interface.
+├── wiki/                  Pure regex functions for Wikipedia (Python 3.6, no pyspark).
+│   ├── wikitext.py    Record fields of the XML dump, military filter, templates, infobox, abstract, links, langlinks.
+│   ├── keys.py        Join keys: name variants of the documents, alias keys of the wiki titles and redirects.
+│   └── match.py       Wiki attributes of interest and the score of a join candidate.
+├── spark_jobs/            Spark jobs (spark-submit; Spark 2.4, Python 3.6).
+│   ├── common.py      Spark session, data URIs (file:// or hdfs://), log lines, reports.
+│   ├── extract_pages.py   The regex extractor of part 1 on all pages, in Spark.
+│   ├── wiki_pages.py  Wikipedia XML dump (bz2) -> Parquet page table; regex fields in the JVM.
+│   ├── wiki_anchors.py    Anchor texts and inlinks of the military pages from all EN links.
+│   └── wiki_join.py   Join of the documents with EN and SK Wikipedia, statistics, evaluation.
 ├── reports/
 │   ├── corpus_stats.py    Crawl, disk and token statistics (own tokenizer and tiktoken).
 │   ├── extractor_eval.py  Extractor accuracy against the A-Z catalog pages.
 │   └── search_eval.py     Comparison of the ranking methods (MAP, P@10, R@100, nDCG@10, idf of query terms).
 ├── tools/
-│   └── build_zip.py       Makes the ZIP file with the source code for the wiki submission.
+│   ├── build_zip.py       Makes the ZIP file with the source code for the wiki submission.
+│   ├── download_wiki.py   Downloads the Wikipedia dump files (resume, MD5 check).
+│   └── spark.py           Runs a Spark job with spark-submit in the Docker image of the course.
 ├── tests/
 │   ├── unit/          Tests of pure functions. No network.
 │   ├── integration/   Tests with files in a temporary directory (frontier, index and search).
@@ -97,7 +117,8 @@ MilSearch/
 │   ├── konzultacia2.txt   Wiki page for consultation 2a (DokuWiki syntax, Slovak).
 │   ├── konzultacia2b.txt  Wiki page for consultation 2b (DokuWiki syntax, Slovak).
 │   ├── odovzdanie1.txt    Wiki page for the submission of part 1: the full report (DokuWiki, Slovak).
-│   └── diagrams/          Architecture diagram: HTML source (rough.js), render script, PNG.
+│   ├── konzultacia3.txt   Wiki page for consultation 3: Spark, Wikipedia dump, join (DokuWiki, Slovak).
+│   └── diagrams/          Diagrams (crawler architecture, Spark pipeline): HTML source (rough.js), render script, PNG.
 ├── dist/              Output of tools/build_zip.py (not in git).
 ├── pytest.ini
 ├── requirements.txt
@@ -415,7 +436,7 @@ The crawler identifies itself in the `User-Agent` header. It does not show itsel
    python -m pytest tests/integration
    ```
 
-The project has 73 tests. The tests do not send HTTP requests. Each bug fix has a regression test. The test `tests/unit/test_extractor_pages.py` runs the extractor on 20 real pages (7 small arms, 7 armor, 6 ships) and compares the result with hand-checked values.
+The project has 111 tests (73 for part 1, 38 for part 2). The tests do not send HTTP requests and do not need Spark. Each bug fix has a regression test. The test `tests/unit/test_extractor_pages.py` runs the extractor on 20 real pages (7 small arms, 7 armor, 6 ships) and compares the result with hand-checked values.
 
 ## 11. Code conventions
 
@@ -435,3 +456,96 @@ The project has 73 tests. The tests do not send HTTP requests. Each bug fix has 
 - The S-stemmer only removes plural endings. It does not change verb forms.
 - Some fields exist only on some pages of the site: `total_production` only on armor pages, the shipbuilder only on 19 % of the ship pages, the muzzle velocity on 56 % of the small arms pages. The extractor cannot get values that the site does not show.
 - The cosine methods (`tfidf`, `tfidf_smooth`) put long articles lower. For example, `barrett m82` gives Barrett M82 at rank 5 with `tfidf` and at rank 1 with `bm25`. Thus `bm25` is the default method.
+
+## 13. Part 2: Spark and Wikipedia
+
+### 13.1 Pipeline
+
+| Step | Command | Input | Output |
+|------|---------|-------|--------|
+| 1 | `python -m tools.download_wiki` | dumps.wikimedia.org (dump 20261101) | `data/wiki/dump/en/*.bz2` (71 files), `data/wiki/dump/sk/*` |
+| 2 | `python -m tools.spark extract_pages` | `data/raw/*/*.html` | `data/spark/parsed/` (JSON lines) |
+| 3 | `python -m tools.spark wiki_pages --lang en` | EN dump | `data/wiki/en/pages/is_military=true\|false/` (Parquet) |
+| 4 | `python -m tools.spark wiki_pages --lang sk` | SK dump | `data/wiki/sk/pages/` (Parquet) |
+| 5 | `python -m tools.spark wiki_anchors` | EN page table | `data/wiki/en/anchors/` (Parquet) |
+| 6 | `python -m tools.spark wiki_join` | steps 2–5, SK langlinks dump | `data/wiki/joined.jsonl`, `data/wiki/joined/` |
+| 7 | `python -m indexer.build --wiki` | `data/parsed/`, `data/wiki/joined.jsonl` | `data/index/` with the Wikipedia zones |
+
+Each Spark job writes a report to `data/reports/<job>.json` and `data/reports/<job>.dokuwiki.txt`.
+
+`tools/spark.py` packs `extractor/`, `wiki/` and `spark_jobs/` into `dist/milsearch-spark.zip` and runs:
+
+```bash
+docker run --rm -v <project>:/app -w /app -e PYSPARK_PYTHON=python3 --entrypoint spark-submit \
+    iisas/hadoop-spark-pig-hive:2.9.2 --master local[16] --driver-memory 20g \
+    --py-files dist/milsearch-spark.zip spark_jobs/<job>.py [job options]
+```
+
+Launcher options: `--cores N` (default: all CPU cores), `--memory 20g` (driver memory; in local mode the driver is also the executor). Other options go to the job.
+
+On a cluster, copy the data to HDFS and give the HDFS directory to each job:
+
+```bash
+hadoop fs -put data/raw data/wiki/dump /user/root/milsearch/...
+spark-submit --master yarn --py-files milsearch-spark.zip spark_jobs/wiki_pages.py \
+    --data-dir hdfs:///user/root/milsearch --lang en
+```
+
+### 13.2 What each job does
+
+- `extract_pages`: `wholeTextFiles` gives one record per HTML file. Each task runs `extractor.parse.extract_document` (the same regex extractor as part 1). The job counts the documents and the field coverage with `reduceByKey`, and compares the result with `data/parsed/*.jsonl` (full outer join on the document ID).
+- `wiki_pages`: `spark.read.text(..., lineSep="</page>")` gives one record per page. `regexp_extract` (JVM) gets the title, namespace, page ID, redirect target and text. The job keeps namespace 0, decodes the XML entities and marks the military pages (weapon, vehicle or ship infobox or category). One dump file is one partition: Hadoop reads a page two times at the border of two splits of a bz2 file with a multi-byte separator.
+- `wiki_anchors`: splits the text of each article at `[[`, gets the link target and the anchor text with `regexp_extract`, resolves the redirects and keeps the links to military pages (broadcast join). It counts the inlinks and the most frequent anchor texts of each military page.
+- `wiki_join`: see 13.3.
+
+### 13.3 Join of the documents with Wikipedia
+
+1. Document keys: the name in lowercase letters and digits only (`T-72B3` → `t72b3`), in several variants with a rank: full name (0), name without the text in parentheses or without the ship prefix (1), alternative name in parentheses (2), word suffix with a number and a name word (`Panzer IV`) or name after the type words (3), word prefix or last name word (4).
+2. Wiki keys: for each military page, the title and all redirects to it (0) and parts of the title (1): without the text in parentheses (`Comet (tank)`), the ship name (`German battleship Bismarck` → `Bismarck`), the class (`Nanuchka-class corvette` → `Nanuchka class`), without a type word (`T-60 tank`).
+3. Equi-join on the key → candidates (document, page).
+4. Each candidate page is parsed with regex (infobox, categories, abstract). The score: `10 − 2 × (document rank + alias rank)`; +3 for a page of the expected kind (ship for ships; small arm or weapon for smallarms; heavy equipment or weapon for armor), −6 for another kind; +3 for a year within 3 years (+1 within 10 years, −5 more than 30 years away); −3 for a weak name match (rank sum 2 or more) without a year within 10 years; +2 when the page names the country; −10 for an index page or a type article (`Medium tank`) without an exact name match; −6 for an infobox of another thing (company, event, person); −10 for another hull number in the title; −4 for another ship type or weapon type (mortar vs. carbine). The best page with a score of 8 or more is the result.
+5. The result gets the redirects, the anchor texts and the Slovak page (interlanguage links from `skwiki-*-langlinks.sql.gz`, parsed with regex).
+6. Evaluation: 51 hand-checked pairs in `tests/fixtures/wiki_gold.tsv` (precision, recall) and a random sample of 40 pairs in the report.
+
+### 13.4 Wikipedia attributes
+
+| Attribute | Infobox parameters | Why |
+|-----------|-------------------|-----|
+| `designer`, `design_date` | `designer`, `design_date` | MilitaryFactory does not give the designer. |
+| `manufacturer` | `manufacturer`, `builder(s)` | Complete list; MilitaryFactory has the shipbuilder on 19 % of the ship pages only. |
+| `unit_cost` | `unit_cost`, `cost` | Not on MilitaryFactory. |
+| `number_built` | `number`, `total_ships_completed` | MilitaryFactory has the production only on armor pages. |
+| `service`, `production_date` | `service`, `in_service_range`, `production_date`, `built_range` | Time ranges (MilitaryFactory has one year). |
+| `wars` | `wars`, `battles` | Conflicts (filter `wiki_wars:vietnam`). |
+| `laid_down`, `launched`, `commissioned`, `decommissioned`, `fate`, `status` | `ship_*` / career section | Career of a ship. |
+| names | title, redirects, anchor texts, Slovak title | Search by other names (`Katyusha`, `Tommy gun`). |
+| abstract, categories | lead section, `[[Category:...]]` | Short description in English and Slovak. |
+
+`python -m indexer.build --wiki` adds the zones `wiki_names` (weight 2), `wiki_abstract` and `wiki_wars` (weight 1), and the fields `wiki_title`, `sk_title`, `wiki_inlinks_count` and `wiki_<attribute>` for the filters.
+
+### 13.5 Current results
+
+These values come from the dump of 1 November 2026 (`python -m tools.spark ...` with `--cores 16 --memory 20g`).
+
+| Job | Result | Time |
+|-----|--------|------|
+| `extract_pages` | 3,711 documents, the same as the sequential extractor (3,711 of 3,711 equal JSON) | 76 s |
+| `wiki_pages --lang en` | 25.9 GB bz2 (71 files) → 19,357,214 pages: 12,097,295 redirects, 7,259,919 articles, 67,818 military pages | 27 min |
+| `wiki_pages --lang sk` | 0.36 GB bz2 → 349,051 pages (sequential check with `bzcat \| grep`: 349,051) | 3.5 min |
+| `wiki_anchors` | 2,001,417 links to 62,047 military pages | 7.5 min |
+| `wiki_join` | 2,756 of 3,711 documents (74.3 %) → 2,575 unique EN pages, 292 unique SK pages | 73 s |
+
+| Check | Result |
+|-------|--------|
+| Hand-checked pairs (`tests/fixtures/wiki_gold.tsv`) | 51 of 51 correct (the rules were tuned on these pairs) |
+| Random samples of the result (40 + 50 pairs) | 90 of 90 correct |
+| Search evaluation, `bm25`, without → with `--wiki` | MAP 0.754 → 0.808, P@10 0.61 → 0.68, R@100 0.912 → 0.934, nDCG@10 0.841 → 0.876 |
+
+The reports are in `data/reports/spark_extract.*`, `wiki_pages_en.*`, `wiki_pages_sk.*`, `wiki_anchors.*`, `wiki_join.*` and `search_eval_wiki.*` (search evaluation with the Wikipedia zones; `search_eval.*` stays the part 1 evaluation).
+
+### 13.6 Known limitations of part 2
+
+- The local run uses one machine (`local[16]`). One bz2 file is one partition, so the largest file sets the minimum time of `wiki_pages`.
+- The military pre-filter (infobox or category) is broad: it also marks some pages about people (categories such as "... Artillery Branch personnel"). The score of the join removes them.
+- 955 documents have no join result: the object has no English article, Wikipedia uses a very different name (`Carro Armato L3` → `L3/35`), or no year confirms a weak name match. The rules prefer precision to recall.
+- The Slovak Wikipedia has few military articles: 292 of the 2,575 joined English pages have a Slovak version.
