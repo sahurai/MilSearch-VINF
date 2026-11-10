@@ -1,0 +1,304 @@
+====== MilSearch – 3. Konzultácia: spracovanie „veľkých“ dát ======
+
+**Termín:** 11. 11. 2026 \\
+**Kód:** [[https://github.com/sahurai/MilSearch-VINF|GitHub – MilSearch-VINF]] (nové priečinky ''spark_jobs/'', ''wiki/'', nástroje ''tools/spark.py'' a ''tools/download_wiki.py'') \\
+**Obsah:** prechod na distribuované spracovanie v Apache Spark, spracovanie Wikipedia dumpu (EN, SK) regulárnymi výrazmi, join vyextrahovaných dát s Wikipédiou, počet pripojených stránok, zaujímavé atribúty.
+
+**Zhrnutie:**
+  * Spark spracoval **26,6 GB** komprimovaných dát (EN Wikipédia 25,9 GB bz2 = 19,4 mil. stránok, 74 mld. znakov wikitextu; SK Wikipédia; stránky z 1. časti).
+  * Regex extraktor z 1. časti beží v Sparku a dáva **rovnaký výsledok** ako sekvenčný (3 711 / 3 711 dokumentov).
+  * Join pripojil **2 756 z 3 711 dokumentov (74,3 %)** k **2 575 unikátnym stránkam anglickej** a **292 unikátnym stránkam slovenskej Wikipédie**.
+  * Presnosť joinu: 51/51 ručne overených párov a **90/90** párov v dvoch náhodných vzorkách.
+  * Dáta z Wikipédie zlepšili vyhľadávanie z 1. časti: BM25 **MAP 0,754 → 0,808**, P@10 0,61 → 0,68.
+
+===== 1. Prostredie a dáta =====
+
+^ Položka ^ Hodnota ^
+| Spark | **Apache Spark 2.4.3** (PySpark), Python 3.6.9, Java 8 |
+| Prostredie | Docker image predmetu ''iisas/hadoop-spark-pig-hive:2.9.2'' (prednáška 08), ''spark-submit --master local[16]'', 20 GB pamäte |
+| Spustenie | ''python -m tools.spark <úloha>'' – zbalí kód do ''milsearch-spark.zip'' (''--py-files'') a spustí ''spark-submit'' v kontajneri |
+| Klaster | ten istý príkaz s ''--master yarn'' a ''--data-dir hdfs:///user/root/milsearch'' (všetky cesty sú URI, nie lokálne súbory) |
+| Úložisko | textové súbory (JSON lines) a **Parquet**, bez databázy |
+
+Kód, ktorý Spark spúšťa (''extractor/parse.py'', ''wiki/'', ''spark_jobs/''), je v syntaxi **Python 3.6**, lebo image predmetu má Python 3.6. Extraktor z 1. časti som preto upravil (typy z ''typing'' namiesto ''X | None'', bez ''removesuffix''). Logika sa nezmenila – všetkých 73 testov z 1. časti prechádza a výstup je zhodný (kapitola 2).
+
+^ Zdroj ^ Súbory ^ Komprimované ^ Rozbalené ^ Záznamy ^
+| MilitaryFactory (1. časť, vlastný crawler) | 3 717 HTML | – | 287,5 MB | 3 711 dokumentov |
+| Wikipédia EN, dump 2026-11-01 (''pages-articles'') | 71 × bz2 | 25,90 GB | 74,0 mld. znakov wikitextu | 19 357 214 stránok (ns 0) |
+| Wikipédia SK, dump 2026-11-01 | 1 × bz2 | 0,36 GB | 1,41 mld. znakov | 349 051 stránok (ns 0) |
+| SK medzijazykové odkazy (''langlinks'', SQL dump) | 1 × gz | 0,10 GB | – | 254 001 odkazov sk → en |
+| **Spolu** | | **26,6 GB** | | |
+
+Dump sťahuje ''python -m tools.download_wiki'': iba 2 spojenia naraz (pri 3 a viac vráti Wikimedia HTTP 429), pokračovanie cez HTTP Range a kontrola **MD5** každého súboru. Kontrola MD5 odhalila poškodené súbory (pri prvom pokuse zapisovali dve sťahovania do jedného súboru) a nástroj ich stiahol znova. Všetkých 73 súborov má správny MD5. Minimum 500 MB je splnené.
+
+{{milsearch_spark_pipeline.png?direct&1100|Spracovanie dát v Apache Spark}}
+
+===== 2. Prechod kódu z 1. časti na Spark =====
+
+Úloha ''spark_jobs/extract_pages.py'' spustí **ten istý regex extraktor** z 1. časti (''extractor.parse.extract_document'') paralelne v Spark úlohách. Štatistiky (počet dokumentov, vyplnenie polí) počíta Spark cez ''reduceByKey''.
+
+<code python>
+pages = spark.sparkContext.wholeTextFiles(get_data_uri(data_dir, "raw", "*", "*.html"), minPartitions=64)
+documents = pages.mapPartitions(extract_partition).cache()        # extract_document() v každej úlohe
+spark.createDataFrame(documents.map(lambda line: (line,)), ["value"]).write.mode("overwrite").text(output_uri)
+# štatistika v Sparku: počet dokumentov a vyplnenie polí po kategóriách
+counts = dict(documents.flatMap(get_coverage_pairs).reduceByKey(lambda a, b: a + b).collect())
+# kontrola: full outer join so sekvenčným výstupom 1. časti podľa ID dokumentu
+joined = documents.map(get_canonical_json).fullOuterJoin(sequential.map(get_canonical_json))
+</code>
+
+^ Spark ^ Partície ^ Vstup ^ Dokumenty ^ Čas ^ Porovnanie so sekvenčným extraktorom ^
+| 2.4.3, ''local[16]'' | 64 | 3 717 HTML súborov | 1 314 smallarms, 1 263 armor, 1 134 ships | 75,7 s | **same = 3 711** (žiadne ''only_spark'', ''only_sequential'', ''different'') |
+
+===== 3. Spracovanie Wikipedia dumpu v Sparku (regex) =====
+
+==== 3.1 Dump → tabuľka stránok ====
+
+Úloha ''spark_jobs/wiki_pages.py''. Dump je XML, ale **nepoužívam XML parser**. Spark číta bz2 súbory ako text s oddeľovačom záznamov ''</page>'' (jeden záznam = jedna stránka) a polia vyberá regulárnymi výrazmi priamo v JVM (''regexp_extract''), teda bez prenosu 74 GB textu do Pythonu.
+
+<code python>
+TITLE_PATTERN = r"<title>([^<]*)</title>"
+NAMESPACE_PATTERN = r"<ns>(\d+)</ns>"
+PAGE_ID_PATTERN = r"<id>(\d+)</id>"                       # prvé <id> je ID stránky (pred <revision>)
+REDIRECT_PATTERN = r"<redirect title=\"([^\"]*)\""
+TEXT_PATTERN = r"(?s)<text[^>]*>(.*)</text>"
+MILITARY_INFOBOX_PATTERN = r"(?i)\{\{\s*infobox[ _]+(weapon|firearm|gun\b|artillery|military vehicle|afv|tank|ship|submarine|...)"
+
+records = spark.read.text(input_uri, lineSep="</page>")
+pages = records.select(
+    F.regexp_extract("value", TITLE_PATTERN, 1).alias("title"),
+    F.regexp_extract("value", NAMESPACE_PATTERN, 1).alias("ns"),
+    F.regexp_extract("value", PAGE_ID_PATTERN, 1).cast("long").alias("id"),
+    F.regexp_extract("value", REDIRECT_PATTERN, 1).alias("redirect"),
+    F.regexp_extract("value", TEXT_PATTERN, 1).alias("raw_text"),
+).where((F.col("title") != "") & (F.col("ns") == "0"))            # iba články (namespace 0)
+# + dekódovanie XML entít (regexp_replace), príznak is_military (rlike infobox / kategória)
+pages.write.mode("overwrite").partitionBy("is_military").parquet(output_uri)
+</code>
+
+^ Wikipédia ^ Dump (bz2) ^ Wikitext ^ Stránky (ns 0) ^ Presmerovania ^ Články ^ Vojenská technika (predfilter) ^ Partície ^ Čas ^
+| EN | 25,90 GB | 74,0 mld. znakov | 19 357 214 | 12 097 295 | 7 259 919 | 67 818 | 71 | 27,0 min |
+| SK | 0,36 GB | 1,41 mld. znakov | 349 051 | 86 999 | 262 052 | 16 ((Predfilter používa anglické infoboxy a kategórie. SK stránky sa pripájajú cez medzijazykové odkazy, nie cez predfilter.)) | 1 | 3,5 min |
+
+  * Výstup je tabuľka v **Parquet** (''id, title, redirect, text_bytes, text''; EN 33 GB), rozdelená podľa ''is_military''. Ďalšie úlohy čítajú iba potrebné stĺpce a iba partíciu s vojenskou technikou.
+  * ''is_military'' = infobox zbrane, vozidla alebo lode, alebo kategória typu „…rifles“, „…tanks“, „…submarines“. Je to široký predfilter (vysoký recall, obsahuje aj napr. osoby z kategórií „…Artillery Branch personnel“). Presnosť zabezpečí až skóre pri joine (kapitola 4).
+  * **Zistenie:** Hadoop pri delení bz2 súboru na viac splitov s viacbajtovým oddeľovačom prečíta stránku na hranici splitu **dvakrát** (test na 1. súbore: 27 152 záznamov pre 27 151 stránok, duplikát ''Premier of New South Wales''). Preto platí **1 bz2 súbor = 1 partícia** (''maxPartitionBytes = openCostInBytes = 1 TB''). EN dump má 71 súborov, teda 71 paralelných úloh.
+  * **Kontrola:** sekvenčné ''bzcat | grep -c "<ns>0</ns>"'' na SK dumpe dá 349 051 stránok – presne toľko ako Spark. Na 1. súbore EN sedí aj počet presmerovaní (6 241).
+
+==== 3.2 Anchor texty a inlinky ====
+
+Úloha ''spark_jobs/wiki_anchors.py'' prejde **všetkých 7,26 mil. článkov**. Text článku rozdelí na ''%%[[%%'', z každého kúsku regex vyberie cieľ odkazu a anchor text, presmerovanie sa nahradí cieľovou stránkou a broadcast join ponechá iba odkazy na vojenské stránky.
+
+<code python>
+LINK_TARGET_PATTERN = r"^([^\[\]|#]*)(?:#[^\[\]|]*)?(?:\|[^\[\]]*)?\]\]"
+LINK_ANCHOR_PATTERN = r"^[^\[\]|]*\|([^\[\]]*)\]\]"
+pieces = articles.select("id", "title", F.explode(F.split("text", r"\[\[")).alias("piece"))
+links = pieces.select(..., F.regexp_extract("piece", LINK_TARGET_PATTERN, 1).alias("target"),
+                           F.regexp_extract("piece", LINK_ANCHOR_PATTERN, 1).alias("anchor"))
+links = links.join(F.broadcast(names), "name")      # názov alebo presmerovanie -> vojenská stránka
+inlinks = links.groupBy("page").agg(F.countDistinct("source_id").alias("inlinks_count"), ...)
+</code>
+
+Výsledok: **2 001 417 odkazov** na 62 047 vojenských stránok (7,5 min). Najčastejšie odkazované stránky, ktoré join pripojil:
+
+^ Stránka ^ Inlinky ^ Najčastejšie anchor texty ^ Dokumenty MilitaryFactory ^
+| Oerlikon 20 mm cannon | 5 069 | 20 mm, 20 mm guns, 20 mm Oerlikon, QF 20 mm Oerlikon | 1 |
+| M2 Browning | 2 729 | M2 Browning machine gun, .50 cal (12.7 mm), M2HB, Browning M2 | 2 |
+| AK-47 | 1 831 | **Kalashnikov**, AK47, AK, Kalashnikovs | 3 |
+| Molotov cocktail | 1 423 | **petrol bomb**, Molotov, firebomb | 1 |
+| Lewis gun | 1 392 | Lewis machine gun, Lewis .303 cal machine gun | 1 |
+
+==== 3.3 Wikitext: infobox, kategórie, abstrakt ====
+
+Wikitext kandidátskych stránok (''wiki/wikitext.py'') spracúvam tiež iba regexmi: odstránim komentáre, ''<ref>'', súbory, kategórie (uložím si ich) a odkazy ''%%[[cieľ|text]]%%'' nahradím textom. Šablóny ''%%{{...}}%%'' riešim **od najvnútornejšej**: regex ''%%\{\{([^{}]*)\}\}%%'' (šablóna bez ďalších zátvoriek vo vnútri) opakujem, kým sa text mení. Pri tom ''%%{{convert|3.47|kg}}%%'' → „3.47 kg“, ''%%{{start date|1968|6|22}}%%'' → „1968-06-22“, ''%%{{ubl|a|b}}%%'' → zoznam, ''%%{{USS|Nimitz|CVN-68}}%%'' → „USS Nimitz (CVN-68)“ a parametre každého ''%%{{Infobox ...}}%%'' si uložím. Vnorené infoboxy lodí (''Infobox ship/career'' v ''Infobox ship'') sa tak spoja do jedného. Šablóny ''%%{{shipindex}}%%'' a ''%%{{disambiguation}}%%'' označia rozcestník.
+
+<code python>
+_TEMPLATE_RE = re.compile(r"\{\{([^{}]*)\}\}")
+
+def resolve_templates(text):
+    infoboxes = []
+    for _ in range(_MAX_TEMPLATE_PASSES):
+        new_text = _TEMPLATE_RE.sub(lambda match: _render_template(match.group(1), infoboxes), text)
+        new_text = _TABLE_RE.sub("", new_text)        # najvnútornejšie tabuľky {| ... |}
+        if new_text == text:
+            break
+        text = new_text
+    infoboxes.reverse()                               # vonkajší (hlavný) infobox prvý
+    return text, infoboxes
+</code>
+
+===== 4. Join: MilitaryFactory × Wikipédia =====
+
+==== 4.1 Prečo join ====
+
+MilitaryFactory má podrobné technické parametre (kaliber, rýchlosť, výtlak, posádka). Wikipédia pridá to, čo stránka nemá:
+
+  * **iné názvy** – presmerovania a anchor texty („Stalin's organ“ pre Kaťušu, „Blitz Buggy“ pre Willys MB, „Kalashnikov“ pre AK-47) a **slovenský názov**,
+  * **atribúty z infoboxu** – konštruktér, cena za kus, počet vyrobených kusov, vojny, roky v službe, kariéra lode (položenie kýlu, spustenie, zaradenie, osud),
+  * **abstrakt v angličtine a v slovenčine** a kategórie,
+  * **popularitu** – počet odkazov z iných článkov (inlinky).
+
+Vďaka tomu vyhľadávač odpovie aj na otázky, ktoré samotné dáta z MilitaryFactory nevedia: „ktoré ručné zbrane sa použili vo Vietname“, „ktoré ponorky z 2. svetovej vojny boli potopené“, hľadanie podľa prezývky alebo po slovensky (kapitola 6).
+
+==== 4.2 Ako join funguje ====
+
+Join je **equi-join v Sparku na kľúči názvu**. Kľúč = názov iba z malých písmen a číslic bez diakritiky (''"T-72B3"'' → ''t72b3'', ''"Krag–Jørgensen"'' → ''kragjorgensen''). Tá istá funkcia ''get_name_key'' tvorí kľúče na oboch stranách. Názvy na MilitaryFactory sú iné ako na Wikipédii (''KMS Bismarck'' vs. ''German battleship Bismarck'', ''Colt M16A2'' vs. ''M16 rifle''), preto každá strana má viac variantov kľúča s rankom:
+
+^ Strana ^ Varianty kľúča (rank) ^ Príklad ^
+| MilitaryFactory | 0 celý názov · 1 bez textu v zátvorke / bez prefixu lode · 2 alternatívny názov v zátvorke · 3 prípona s číslom a menom (bez výrobcu) alebo názov bez typových slov · 4 predpona, posledné meno | ''KMS Bismarck'' → ''kmsbismarck'' (0), ''bismarck'' (1); ''Cruiser Tank Comet (A34)'' → ''comet'' (3); ''SdKfz 161 Panzer IV'' → ''panzeriv'' (3) |
+| Wikipédia | 0 názov stránky a **všetkých 12,1 mil. presmerovaní** · 1 časť názvu: bez zátvorky, meno lode, trieda, bez typového slova | ''German battleship Bismarck'' → ''bismarck'' (1); ''Nanuchka-class corvette'' → ''nanuchkaclass'' (1); ''T-60 tank'' → ''t60'' (1); presmerovanie ''M16A2'' → ''M16 rifle'' (0) |
+
+<code python>
+document_keys = spark.createDataFrame(documents_rdd.flatMap(lambda d: [
+    (key, d["id"], rank) for key, rank in build_document_keys(d["name"], d["category"]).items()]), DOCUMENT_KEY_SCHEMA)
+aliases = spark.createDataFrame(title_aliases.union(redirect_aliases), ALIAS_SCHEMA) \
+    .groupBy("key", "page").agg(F.min("alias_rank").alias("alias_rank"))
+candidates = document_keys.join(aliases, "key") \                   # equi-join na kľúči
+    .withColumn("penalty", F.col("doc_rank") + F.col("alias_rank")) \
+    .groupBy("doc_id", "page").agg(F.min(F.struct("penalty", "doc_rank", "alias_rank", "key")).alias("best"))
+page_info = spark.createDataFrame(candidate_pages.rdd.mapPartitions(parse_page_partition), PAGE_INFO_SCHEMA)
+scored = candidates.join(page_info, "page").rdd.map(lambda row: score_candidate(row, documents_broadcast.value))
+best = dict(scored.filter(lambda pair: pair[1][0] >= MIN_MATCH_SCORE).reduceByKey(max).collect())
+</code>
+
+Jeden kľúč môže viesť na viac stránok (''bismarck'' → loď, trieda lodí, rozcestník, mesto). Join dal **7 521 kandidátov** pre 3 162 dokumentov. Každý kandidát dostane **skóre** (''wiki/match.py''):
+
+^ Pravidlo ^ Body ^
+| základ | 10 − 2 × (rank MilitaryFactory + rank Wikipédie) |
+| stránka rovnakého druhu: loď pre lode; ručná zbraň alebo zbraň pre smallarms; ťažká technika alebo zbraň pre armor | +3, iný druh −6 |
+| rok z MilitaryFactory je do 3 rokov od roku v infoboxe (návrh, výroba, služba, spustenie…) | +3 (do 10 rokov +1, nad 30 rokov −5) |
+| slabá zhoda názvu (súčet rankov ≥ 2) bez roku do 10 rokov | −3 |
+| stránka uvádza krajinu (názov, pôvod, používatelia, kategórie; „German“, „Kriegsmarine“…) | +2 |
+| rozcestník, zoznam lodí rovnakého mena, článok o type („Medium tank“, „Dreadnought“) bez presnej zhody názvu | −10 |
+| infobox iného objektu (firma, udalosť, osoba – napr. firma ''Mauser'') | −6 |
+| iné číslo lode v zátvorke (''USS Montgomery (LCS-8)'' vs. ''(DD-121)'') | −10 |
+| iný typ lode (ponorka vs. lietadlová loď) alebo zbrane (mínomet vs. karabína) | −4 |
+
+Výsledok je stránka s najvyšším skóre, ak má **aspoň 8 bodov**. Presná zhoda názvu stránky rovnakého druhu s rokom a krajinou má 18 bodov. K výsledku sa pridajú presmerovania, anchor texty a slovenská stránka. **SK stránku** nájdem cez SQL dump medzijazykových odkazov (''skwiki-*-langlinks.sql.gz''). SQL čítam tiež regexom ''%%\((\d+),'([a-z-]+)','((?:[^'\\]|\\.)*)'\)%%'' (bez databázy) a robím join ''langlinks.en_title = EN stránka'' a ''langlinks.sk_id = SK stránka''.
+
+==== 4.3 Výsledok joinu – koľko unikátnych stránok ====
+
+^ Kategória ^ Dokumenty ^ Pripojené dokumenty ^ Unikátne EN stránky ^ Unikátne SK stránky ^
+| smallarms | 1 314 | 892 (67,9 %) | 789 | 62 |
+| armor | 1 263 | 893 (70,7 %) | 829 | 175 |
+| ships | 1 134 | 971 (85,6 %) | 958 | 55 |
+| **spolu** | **3 711** | **2 756 (74,3 %)** | **2 575** | **292** |
+
+  * **2 575 unikátnych stránok anglickej Wikipédie** a **292 unikátnych stránok slovenskej Wikipédie** (347 dokumentov má aj SK stránku).
+  * Unikátnych stránok je menej ako dokumentov: viac variantov z MilitaryFactory patrí k jednej stránke (napr. 17 modelov Glock → ''Glock'', ''Colt M16A2'', ''Colt M16A4'' a ''Colt M16 (Series)'' → ''M16 rifle''); takých stránok je 132.
+  * Lode majú najvyššie pokrytie: Wikipédia má článok takmer o každej lodi a presmerovania s číslom lode (''USS Nimitz (CVN-68)'' → ''USS Nimitz'').
+  * SK Wikipédia je malá: z 2 575 EN stránok má SK verziu iba 292 (napr. ''Leopard 2'', ''AK-47'', ''Bismarck (bojová loď)''; ''Barrett M82'' ani ''Tiger I'' na SK Wikipédii nie sú – overené v tabuľke stránok aj v langlinks).
+  * **Nepripojené dokumenty (955):** objekt nemá vlastný EN článok (prototypy, malí výrobcovia, napr. ''T-111 (Object 111)'', ''FNAB Model 1943''), Wikipédia ho opisuje pod iným názvom (''Carro Armato L3'' → ''L3/35'') alebo slabú zhodu nepotvrdil rok. Pravidlá uprednostňujú presnosť pred úplnosťou.
+
+^ Variant názvu MilitaryFactory, ktorý pripojil dokument ^ Dokumenty ^
+| 0 – celý názov | 1 354 |
+| 1 – hlavný názov / bez prefixu lode | 773 |
+| 2 – alternatívny názov v zátvorke | 210 |
+| 3 – prípona s číslom a menom / bez typových slov | 236 |
+| 4 – predpona / posledné meno | 183 |
+
+^ Alias Wikipédie, ktorý pripojil dokument ^ Dokumenty ^
+| 0 – názov stránky alebo presmerovanie | 2 315 |
+| 1 – časť názvu (bez zátvorky, typu, národnosti) | 441 |
+
+Celý názov a názov stránky alebo presmerovanie (rank 0 + 0) pripojili 1 271 dokumentov (46 %). Zvyšok potreboval varianty názvu a skóre.
+
+==== 4.4 Ukážky ====
+
+^ Dokument MilitaryFactory ^ Wikipédia EN ^ Wikipédia SK ^ Kľúč ^ Skóre ^
+| Leopard 2 | Leopard 2 | Leopard 2 | ''leopard2'' | 18 |
+| KMS Bismarck | German battleship Bismarck | Bismarck (bojová loď) | ''kmsbismarck'' (presmerovanie) | 18 |
+| Colt M16A2 | M16 rifle | M16 (puška) | ''coltm16a2'' (presmerovanie) | 15 |
+| MP40 (Maschinenpistole 40) | MP 40 | MP40 | ''mp40'' | 16 |
+| USS Nimitz (CVN-68) | USS Nimitz | – | ''ussnimitzcvn68'' (presmerovanie) | 18 |
+| Type VII U-Boat | Type VII submarine | – | ''typeviiuboat'' (presmerovanie) | 18 |
+| Nanuchka (class) / (Project 1234 Ovod) | Nanuchka-class corvette | – | ''nanuchkaclass'' | 13 |
+| Stridsvagn m/21 (Strv m/21) | LK II | – | ''stridsvagnm21'' (presmerovanie) | 16 |
+| BM-8 / BM-13 / BM-31 (Katyusha) | Katyusha rocket launcher | Kaťuša (raketomet) | ''bm8'' (presmerovanie ''BM-8'') | 16 |
+
+Ukážka jedného záznamu z ''data/wiki/joined.jsonl'' (skrátené):
+
+<code json>
+{"id": "armor-37", "name": "Leopard 2", "category": "armor", "country": "Germany", "year": 1979,
+ "wiki_title": "Leopard 2", "wiki_url": "https://en.wikipedia.org/wiki/Leopard_2",
+ "match": {"score": 18, "key": "leopard2", "document_rank": 0, "alias_rank": 0, "accepted_candidates_count": 1},
+ "wiki_attributes": {"designer": "KraussMaffei", "design_date": "1970s",
+   "manufacturer": "KraussMaffei; Maschinenbau Kiel; Rheinmetall; Santa Bárbara Sistemas; Hägglunds AB; Contraves; Hellenic Vehicle Industry",
+   "unit_cost": "2A6 (secondhand): (FY 2007); 2A7+: €13–15 million (FY 2014); 2A8: €29 million (2023)",
+   "production_date": "1979–present", "number_built": "3,600", "service": "1979–present",
+   "wars": "Kosovo War; Prizren incident; War in Afghanistan; Syrian Civil War; Operation Euphrates Shield; Russo-Ukrainian War; Russian invasion of Ukraine"},
+ "wiki_redirects": ["Bergepanzer 3", "Bergepanzer Büffel", "Büffel (armoured recovery vehicle)", "EMES 15", "L2A6", "Leguan bridge layer", "Leo 2", "..."],
+ "wiki_anchors": ["Leopard 2", "Leopard 2A4", "Leopard 2A6", "Leopard 2A8", "Leopard 2A5", "..."],
+ "wiki_inlinks_count": 439,
+ "wiki_abstract": "The Leopard 2 is a third generation German main battle tank (MBT). Developed by Krauss-Maffei in the 1970s, ...",
+ "sk_title": "Leopard 2", "sk_url": "https://sk.wikipedia.org/wiki/Leopard_2",
+ "sk_abstract": "Leopard 2 je nemecký hlavný bojový tank vyrábaný nemeckou spoločnosťou Krauss-Maffei-Wegmann, ..."}
+</code>
+
+==== 4.5 Vyhodnotenie joinu ====
+
+  * **Ručne overené páry** (''tests/fixtures/wiki_gold.tsv'', 51 známych zbraní, vozidiel a lodí): 51 správne, 0 nesprávne, 0 nepripojené. Tieto páry som použil aj pri ladení pravidiel (prvá verzia: 47 správne, 2 nesprávne, 2 nepripojené), preto nie sú nezávislým meraním.
+  * **Nezávislé náhodné vzorky** z finálneho výsledku: 40 párov (v reporte joinu) + 50 ďalších párov – **90/90 správne**. Patria sem aj neočividné prípady: ''Kalashnikov AK-19'' → ''AK-12'', ''Hotchkiss H39'' → ''Hotchkiss H35'', ''Stridsvagn m/21'' → ''LK II'' (varianty opísané v článku o základnom modeli).
+  * Chyby, ktoré som počas vývoja našiel a opravil pravidlami zo 4.2: všeobecný prefix (''Cruiser Tank Comet'' → ''Cruiser tank''), rozcestník (''USS Arizona''), iné číslo lode (''USS Montgomery (LCS-8)'' → ''(DD-121)''), kanón vs. puška (''M59 (M2 Long Tom)'' → ''SKS''), článok o type (''HMS Dreadnought'' → ''Dreadnought'', ''L2 (Grenade)'' → ''Grenade''), mínomet vs. karabína (''Denel M4 Commando'' → ''M4 carbine'').
+  * 314 dokumentov malo viac prijatých kandidátov; rozhodlo vyššie skóre.
+
+===== 5. Zaujímavé atribúty z Wikipédie =====
+
+Hodnoty sú z infoboxu (''wiki/match.py'', ''WIKI_ATTRIBUTE_PARAMETERS''). Pokrytie = podiel z 2 756 pripojených dokumentov.
+
+^ Atribút ^ Parametre infoboxu ^ Pokrytie ^ Prečo je zaujímavý ^
+| ''designer'', ''design_date'' | designer, design_date | 38 % / 41 % | MilitaryFactory konštruktéra neuvádza. |
+| ''manufacturer'' | manufacturer, builder(s) | 82 % | Úplný zoznam výrobcov a lodeníc (MilitaryFactory má lodenicu iba pri 19 % lodí). |
+| ''unit_cost'' | unit_cost, cost | 12 % | Cena za kus – na MilitaryFactory nie je. |
+| ''number_built'' | number, total_ships_completed | 41 % | Počet vyrobených kusov (MilitaryFactory iba pri obrnenej technike). |
+| ''production_date'', ''service'' | production_date, built_range, service, in_service_range | 51 % / 50 % | Obdobie výroby a služby (MilitaryFactory má iba jeden rok). |
+| ''wars'' | wars, battles | 39 % | Vojny a konflikty – filter ''wiki_wars:vietnam''. |
+| ''used_by'' | used_by, operators | 30 % | Doplnenie operátorov. |
+| ''laid_down'', ''launched'', ''commissioned'', ''decommissioned'' | ship_laid_down … | 27–29 %, 15 % | Kariéra lode s presnými dátumami. |
+| ''fate'', ''status'' | ship_fate, ship_status | 17 % / 11 % | Osud lode (potopená, zošrotovaná, múzeum) – filter ''wiki_fate:sunk''. |
+| ''cartridge'', ''action'' | cartridge, caliber, action | 36 % / 28 % | Kontrola kalibra a princípu činnosti z 1. časti. |
+| ''origin'' | origin, place_of_origin, country | 92 % | Krajina pôvodu – použitá pri skóre joinu. |
+| iné názvy | názov, presmerovania, anchor texty, SK názov | 90 % má presmerovania; priemerne 15 mien na dokument | Hľadanie podľa prezývky a po slovensky. |
+| abstrakt, kategórie | úvod článku, ''%%[[Category:…]]%%'' | 100 % EN, 13 % SK | Krátky opis v angličtine a v slovenčine. |
+| inlinky | počet článkov s odkazom | 99,7 % | Popularita – možný prior pre ranking (PyLucene, konzultácia 4). |
+
+Technické parametre z infoboxu (hmotnosť, dĺžka, rýchlosť, posádka, pancier…) majú tiež vysoké pokrytie (55–87 %). Slúžia hlavne na kontrolu hodnôt z MilitaryFactory.
+
+===== 6. Použitie vo vyhľadávači =====
+
+''python -m indexer.build --wiki'' pridá do indexu z 1. časti nové zóny ''wiki_names'' (názov EN stránky, presmerovania, anchor texty, SK názov; váha 2), ''wiki_abstract'' a ''wiki_wars'' (váha 1) a polia ''wiki_<atribút>'' pre filtre. Bez ''--wiki'' je index rovnaký ako v 1. časti (91 837 termov).
+
+^ Dopyt ^ Bez Wikipédie (1. časť) ^ S Wikipédiou ^
+| ''stalin's organ'' | 1. BM-8 / BM-13 / BM-31 (prezývka je v jeho texte), 2. Studebaker US6, 3. IS-10 – BM-8-24 chýba | **1. BM-8-24 (Katyusha)**, 2. BM-8 / BM-13 / BM-31 (prezývka z presmerovania Wikipédie) |
+| ''blitz buggy'' | 1. Opel Blitz, 2. Chenowth Scorpion DPV | **1. Ford GP / GPW**, 2. Opel Blitz, **3. Willys MB (Jeep)** |
+| ''poodle shooter'' (prezývka M4) | UTAS UTS-15, Springfield Hellion, FABARM STF-12 (brokovnice) | **1. Colt M4A1 SOPMOD, 2. Colt M4** |
+| ''samopal'' (slovensky) | 1 výsledok (vz. 23 – slovo je v názve) | **1. vz. 58 (SK: Samopal vzor 58)**, 2. vz. 23, **3. PPS-42 / PPS-43 (SK: PPS (samopal))** |
+| ''wiki_wars:vietnam category:smallarms'' | chyba: pole neexistuje | **139** ručných zbraní (napr. 9M14 Malyutka, XM174, Type 30 rifle) |
+| ''submarine wiki_fate:sunk year:1939..1945'' | chyba: pole neexistuje | **36** ponoriek (napr. Japanese submarine I-21, ORP Jastrząb) |
+| ''wiki_designer:kalashnikov'' | chyba: pole neexistuje | RPK, Saiga-12, AK-101, … |
+
+**Porovnanie na 10 dopytoch z 1. časti** (''python -m reports.search_eval''; relevantné dokumenty určujú štruktúrované polia, nie text):
+
+^ Metóda ^ MAP ^ P@10 ^ R@100 ^ nDCG@10 ^
+| ''tfidf'' | 0,475 → 0,491 | 0,55 → 0,53 | 0,835 → 0,852 | 0,605 → 0,597 |
+| ''tfidf_smooth'' | 0,462 → 0,484 | 0,53 → 0,57 | 0,831 → 0,836 | 0,580 → 0,628 |
+| ''bm25'' | **0,754 → 0,808** | **0,61 → 0,68** | **0,912 → 0,934** | **0,841 → 0,876** |
+
+  * Najväčší zisk BM25: Q7 ''japanese battleship'' (AP 0,66 → 1,00; top 5 sú teraz iba japonské bojové lode, predtým aj USS South Dakota) a Q4 ''german submarine world war 2'' (0,43 → 0,66; v top 5 sú Type VII, Seehund a Type II namiesto FS Surcouf a HMS Upholder). Abstrakt z Wikipédie uvádza národnosť a typ hneď v prvej vete („The Type VII is a class of medium U-boats built for Nazi Germany's Kriegsmarine from 1935 to 1945“), teda tieto termy majú v dokumente vyššie tf.
+  * Pokles: Q6 ''soviet self-propelled howitzer'' (0,53 → 0,42). Abstrakt pridal slová „self-propelled howitzer“ aj čínskej húfnici Type 83 (PLZ-83, teraz 1. miesto) a SU-152, ktorú MilitaryFactory vedie ako iný typ, takže podľa štruktúrovaných polí nie je relevantná.
+
+===== 7. Testy =====
+
+Spolu **111 testov** (''python -m pytest''), všetky prechádzajú, bez siete a bez Sparku. Nových je 38:
+
+^ Súbor ^ Čo testuje ^
+| ''tests/unit/test_wikitext.py'' | Regexy záznamu dumpu (titul, ns, ID, presmerovanie, XML entity), predfilter vojenských stránok, šablóny od najvnútornejšej (''convert'', dátumy, zoznamy, lode), vnorené infoboxy, kategórie, abstrakt, odkazy, rozcestníky, langlinks zo SQL. |
+| ''tests/unit/test_wiki_keys.py'' | Kľúče názvov (diakritika, ''Krag–Jørgensen''), varianty MilitaryFactory a aliasy Wikipédie, atribúty, roky, druh stránky, skóre a všetky penalizácie zo 4.2 na reálnych chybách. |
+| ''tests/integration/test_wiki_index.py'' | Index s ''--wiki'': hľadanie podľa mena z Wikipédie a filter ''wiki_wars''. |
+
+Moduly pre Spark sa navyše kompilujú a importujú v Pythone 3.6 v image predmetu.
+
+===== 8. Ďalšie kroky (konzultácia 4) =====
+
+  * Index v PyLucene nad spojenými dátami (polia z MilitaryFactory + Wikipédia EN a SK, inlinky ako prior).
+  * Porovnanie vlastného indexu a PyLucene na rovnakých dopytoch.

@@ -130,9 +130,10 @@ def _format_hit(hit: SearchHit) -> str:
 
     Steps:
         1. Join the rank, the score, the name, the category, the country, the year and the key fields.
+        2. Add the Wikipedia pages of the join (index built with --wiki).
 
     Returns:
-        One result line and the URL line.
+        One result line, the URL line and the Wikipedia line.
     """
     # 1. Join the rank, the score, the name, the category, the country, the year and the key fields
     row = hit.row
@@ -140,10 +141,14 @@ def _format_hit(hit: SearchHit) -> str:
         f"{name}={row[name]:g}" if isinstance(row.get(name), float) else f"{name}={row.get(name)}"
         for name in _DISPLAY_FIELDS.get(row["category"], ()) if row.get(name) is not None
     )
-    return (
+    line = (
         f"{hit.rank:>3}. {hit.score:7.4f}  {row['name']}  [{row['category']} | {row.get('country')} | "
         f"{row.get('year')}]  {details}\n       {row.get('url')}"
     )
+    # 2. Add the Wikipedia pages of the join (index built with --wiki)
+    if row.get("wiki_title"):
+        line += f"\n       wiki: {row['wiki_title']}" + (f" | sk: {row['sk_title']}" if row.get("sk_title") else "")
+    return line
 
 
 # ==============================================================================

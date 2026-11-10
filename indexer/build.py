@@ -7,6 +7,7 @@
 #
 # RESPONSIBILITIES:
 #     1. Load the extracted documents and the anchor texts of the links between detail pages.
+#        With --wiki, add the Wikipedia data of the join (spark_jobs/wiki_join.py): other names, abstract, attributes.
 #     2. Make the weighted fields (zones) of each document and change them into terms.
 #     3. Collect a postings list for each term in memory (single pass, SPIMI style).
 #     4. Write the dictionary, the postings, the document table and the index metadata.
@@ -16,7 +17,8 @@
 #     indexer.tokenizer — terms from text.
 #
 # USAGE:
-#     python -m indexer.build
+#     python -m indexer.build            # part 1: MilitaryFactory data only
+#     python -m indexer.build --wiki     # part 2: + Wikipedia data from data/wiki/joined.jsonl
 #
 # FORMULAS:
 #     tf(t, d)    = sum over zones z of weight(z) * count(t in z)
@@ -31,6 +33,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import math
@@ -53,6 +56,7 @@ DICTIONARY_PATH: Path = INDEX_DIR / "dictionary.tsv"
 POSTINGS_PATH: Path = INDEX_DIR / "postings.txt"
 DOCUMENTS_PATH: Path = INDEX_DIR / "documents.jsonl"
 META_PATH: Path = INDEX_DIR / "meta.json"
+WIKI_JOINED_PATH: Path = DATA_DIR / "wiki" / "joined.jsonl"
 
 # Zone weights. The name is the strongest signal; type, roles, country and caliber describe
 # the object; the long article text has the base weight.
@@ -63,10 +67,13 @@ ZONE_WEIGHTS: dict[str, float] = {
     "country": 2.0,
     "caliber": 2.0,
     "anchors": 2.0,
+    "wiki_names": 2.0,      # Wikipedia title, redirects, anchor texts and Slovak title (only with --wiki).
     "manufacturer": 1.0,
     "operators": 1.0,
     "site_categories": 1.0,
     "summary": 1.0,
+    "wiki_abstract": 1.0,   # Lead section of the English and the Slovak page (only with --wiki).
+    "wiki_wars": 1.0,
     "armament": 1.0,
     "variants": 1.0,
     "ships_in_class": 1.0,
@@ -77,6 +84,13 @@ _ZONE_POSITION_GAP = 50       # Larger than any phrase query, so no phrase cross
 _TEXT_FIELDS_NOT_STORED: frozenset[str] = frozenset({"text", "specs"})  # Large; not needed for display.
 _DETAIL_SOURCE_MARKER = "/detail.php?"  # Anchor texts from catalogs are template text ("71 1982 ...").
 
+
+# Wikipedia attributes that become document fields "wiki_<attribute>" (filters such as wiki_wars:vietnam).
+_WIKI_ATTRIBUTES: tuple[str, ...] = (
+    "designer", "unit_cost", "number_built", "production_date", "service", "wars", "used_by", "laid_down",
+    "launched", "commissioned", "decommissioned", "fate", "status",
+)
+_MAX_WIKI_NAMES_COUNT = 30
 
 # ==============================================================================
 # TYPES
@@ -141,6 +155,44 @@ def _load_anchor_texts(anchors_path: Path) -> dict[str, list[str]]:
             if anchor_text and anchor_text not in texts_by_url[target_url]:
                 texts_by_url[target_url].append(anchor_text)
     return dict(texts_by_url)
+
+
+def _load_wiki_fields(path: Path) -> dict[str, Document]:
+    """
+    Load the Wikipedia fields of the joined documents.
+
+    Steps:
+        1. Read data/wiki/joined.jsonl.
+        2. Make the fields: title, URLs, other names, abstract and the selected attributes.
+
+    Returns:
+        Map from document ID to its Wikipedia fields; empty when the file does not exist.
+    """
+    fields_by_id: dict[str, Document] = {}
+    if not path.exists():
+        logger.warning("SKIPPED wiki | reason=no_joined_file path=%s", path)
+        return fields_by_id
+
+    # 1. Read data/wiki/joined.jsonl
+    with path.open(encoding="utf-8") as file_handle:
+        for line in file_handle:
+            record = json.loads(line)
+
+            # 2. Make the fields: title, URLs, other names, abstract and the selected attributes
+            names = [record["wiki_title"], *record.get("wiki_redirects", []), *record.get("wiki_anchors", [])]
+            if record.get("sk_title"):
+                names.append(record["sk_title"])
+            fields: Document = {
+                "wiki_title": record["wiki_title"], "wiki_url": record["wiki_url"],
+                "sk_title": record.get("sk_title"), "sk_url": record.get("sk_url"),
+                "wiki_names": list(dict.fromkeys(names))[:_MAX_WIKI_NAMES_COUNT],
+                "wiki_abstract": "\n".join(text for text in (record.get("wiki_abstract"), record.get("sk_abstract")) if text),
+                "wiki_inlinks_count": record.get("wiki_inlinks_count", 0),
+            }
+            attributes = record.get("wiki_attributes", {})
+            fields.update({f"wiki_{name}": attributes[name] for name in _WIKI_ATTRIBUTES if attributes.get(name)})
+            fields_by_id[record["id"]] = fields
+    return fields_by_id
 
 
 def _get_zone_text(document: Document, zone: str, anchor_texts: list[str]) -> str:
@@ -281,21 +333,27 @@ def main() -> None:
     Build the index from data/parsed and write it to data/index.
 
     Steps:
-        1. Load the documents and the anchor texts.
+        1. Load the documents and the anchor texts; with --wiki, add the Wikipedia fields.
         2. Build the postings and the document table.
         3. Compute the metadata and write the index files.
 
     Returns:
         None.
     """
+    parser = argparse.ArgumentParser(description="Build the MilSearch inverted index.")
+    parser.add_argument("--wiki", action="store_true", help=f"Add the Wikipedia data from {WIKI_JOINED_PATH}.")
+    arguments = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S")
     started_at = time.monotonic()
 
-    # 1. Load the documents and the anchor texts
+    # 1. Load the documents and the anchor texts; with --wiki, add the Wikipedia fields
     documents = _load_documents(CATEGORIES)
     anchor_texts_by_url = _load_anchor_texts(ANCHORS_PATH)
-    logger.info("STARTED index | documents_count=%d anchor_targets_count=%d",
-                len(documents), len(anchor_texts_by_url))
+    wiki_fields_by_id = _load_wiki_fields(WIKI_JOINED_PATH) if arguments.wiki else {}
+    for document in documents:
+        document.update(wiki_fields_by_id.get(document["id"], {}))
+    logger.info("STARTED index | documents_count=%d anchor_targets_count=%d wiki_documents_count=%d",
+                len(documents), len(anchor_texts_by_url), len(wiki_fields_by_id))
 
     # 2. Build the postings and the document table
     postings, rows = build_index(documents, anchor_texts_by_url)
@@ -309,6 +367,7 @@ def main() -> None:
         "positions_count": sum(len(positions) for postings_list in postings.values() for *_, positions in postings_list),
         "avg_length": sum(row["length"] for row in rows) / len(rows) if rows else 0.0,
         "zone_weights": ZONE_WEIGHTS,
+        "wiki_documents_count": len(wiki_fields_by_id),
         "built_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     save_index(postings, rows, meta, INDEX_DIR)

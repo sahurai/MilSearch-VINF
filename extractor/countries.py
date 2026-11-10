@@ -17,11 +17,9 @@
 #     one successor state. They keep their own names.
 # ==============================================================================
 
-from __future__ import annotations
-
 import re
 import unicodedata
-from collections.abc import Iterable
+from typing import Dict, FrozenSet, Iterable, List, Optional
 from urllib.parse import unquote
 
 # ==============================================================================
@@ -29,7 +27,7 @@ from urllib.parse import unquote
 # ==============================================================================
 
 # Lookup key (lowercase letters and digits only) -> canonical name.
-_CANONICAL_NAME_BY_KEY: dict[str, str] = {
+_CANONICAL_NAME_BY_KEY: Dict[str, str] = {
     # ---- Historical states with one clear successor ----
     "nazigermany": "Germany",
     "imperialgermany": "Germany",
@@ -65,7 +63,7 @@ _CANONICAL_NAME_BY_KEY: dict[str, str] = {
 }
 
 # Values that the site shows in place of a country, for example an empty form field.
-_PLACEHOLDER_KEYS: frozenset[str] = frozenset({"pleaseselect"})
+_PLACEHOLDER_KEYS: FrozenSet[str] = frozenset({"pleaseselect"})
 
 _KEY_RE = re.compile(r"[^a-z0-9]")
 _SPACE_RE = re.compile(r"\s+")
@@ -99,7 +97,7 @@ def get_country_key(name: str) -> str:
 # MAIN LOGIC
 # ==============================================================================
 
-def get_canonical_country(name: str | None) -> str | None:
+def get_canonical_country(name: Optional[str]) -> Optional[str]:
     """
     Get the canonical name of one country.
 
@@ -127,7 +125,7 @@ def get_canonical_country(name: str | None) -> str | None:
     return _CANONICAL_NAME_BY_KEY.get(key, cleaned)
 
 
-def get_canonical_countries(names: Iterable[str]) -> list[str]:
+def get_canonical_countries(names: Iterable[str]) -> List[str]:
     """
     Get the sorted canonical names of a list of countries without duplicates.
 
