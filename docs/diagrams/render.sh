@@ -2,6 +2,7 @@
 # Render the diagram sources to PNG with headless Edge:
 #   crawler_architecture.html -> milsearch_crawler_architecture.png
 #   spark_pipeline.html       -> milsearch_spark_pipeline.png
+#   lucene_pipeline.html      -> milsearch_lucene_pipeline.png (render.sh lucene_pipeline.html milsearch_lucene_pipeline.png 800)
 # The pages load rough.js and the Kalam font from the internet.
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"

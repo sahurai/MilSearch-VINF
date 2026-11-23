@@ -1,0 +1,275 @@
+====== MilSearch – 4. Konzultácia: Lucene index ======
+
+**Termín:** 25. 11. 2026 \\
+**Kód:** [[https://github.com/sahurai/MilSearch-VINF|GitHub – MilSearch-VINF]] (nový priečinok ''lucene_index/'', nástroj ''tools/lucene.py'', testy ''tests/unit/test_lucene_schema.py'' a ''tests/integration/test_lucene_index.py'') \\
+**Obsah:** hotový Spark kód, návrh a implementácia indexu v PyLucene, odôvodnenie polí, nový index v aplikácii, porovnanie starého a nového indexu, typy dopytov.
+
+**Zhrnutie:**
+  * Spark kód z 3. konzultácie je hotový (4 úlohy: extrakcia, Wikipedia dump EN/SK, anchor texty, join). Lucene index číta jeho výsledok ''data/wiki/joined.jsonl''.
+  * Nový index v **PyLucene 10.0.0 (Apache Lucene 10.0.0)** obsahuje tých istých 3 711 dokumentov ako vlastný index. Má **56 polí** v 5 druhoch: text, kľúčové slovo, celé číslo, desatinné číslo, iba uložené.
+  * Index je **4× menší** (9,2 MB oproti 37,4 MB) a vznikne **2× rýchlejšie** (4,9 s oproti 11,6 s).
+  * Aplikácia hľadá v novom indexe cez ''python -m indexer.search "…" --engine lucene''. Podporuje **Boolean (AND/OR/NOT, +/−), frázu, blízkosť slov, fuzzy, wildcard, regexp, rozsah, dopyt na pole, boost, zátvorky** a triedenie podľa čísla.
+  * Na 10 hodnotiacich dopytoch: Lucene s **BM25F** (''CombinedFieldQuery'') má **MAP 0,818**, vlastný BM25 **0,808**. Lucene s klasickým ''MultiFieldQueryParser'' (BM25 každého poľa zvlášť) má iba **0,654** (vysvetlenie v kapitole 6.3).
+
+===== 1. Hotový Spark kód =====
+
+Spark kód je v priečinku ''spark_jobs/'' a beží v Docker image predmetu ''iisas/hadoop-spark-pig-hive:2.9.2'' (Spark 2.4.3, Python 3.6): ''python -m tools.spark <úloha>''. Na klastri sa spustí ten istý ''spark-submit'' s ''--master yarn'' a ''--data-dir hdfs:///…''. Podrobný opis je na stránke 3. konzultácie.
+
+^ Úloha ^ Vstup ^ Výstup ^ Výsledok ^ Čas ^
+| ''extract_pages'' | 3 717 HTML stránok z 1. časti | ''data/spark/parsed/'' (JSON lines) | 3 711 dokumentov, zhodných so sekvenčným extraktorom | 75,7 s |
+| ''wiki_pages --lang en / sk'' | Wikipedia dump EN 25,9 GB + SK 0,36 GB (bz2) | ''data/wiki/{en,sk}/pages/'' (Parquet) | 19 357 214 + 349 051 stránok, regexy bez XML parsera | 27,0 + 3,5 min |
+| ''wiki_anchors'' | tabuľka stránok EN | ''data/wiki/en/anchors/'' (Parquet) | 2 001 417 odkazov na 62 047 vojenských stránok | 7,5 min |
+| ''wiki_join'' | dokumenty, stránky, anchor texty, SK langlinks | ''data/wiki/joined.jsonl'' | 2 756 dokumentov → **2 575 unikátnych EN** a **292 SK** stránok | 1,5 min |
+
+Lucene index aj vlastný index berú dokumenty z tej istej funkcie ''indexer.build.load_index_documents'': dokumenty z extraktora + anchor texty MilitaryFactory + polia Wikipédie z joinu. Oba indexy teda majú rovnaké dáta a porovnanie v kapitole 6 je férové.
+
+{{milsearch_lucene_pipeline.png?direct&1100|Lucene index v MilSearch}}
+
+===== 2. Prostredie PyLucene =====
+
+^ Položka ^ Hodnota ^
+| Knižnica | **PyLucene 10.0.0** = Apache Lucene 10.0.0 cez JCC (Python volá Java triedy Lucene) |
+| Prostredie | Docker image ''coady/pylucene:10'' (Python 3.15, Java, PyLucene). Image predmetu PyLucene nemá (overené: ''import lucene'' zlyhá). |
+| Spustenie | ''python -m tools.lucene build / search / compare / test'' – spustí kontajner s projektom v ''/app'' |
+| Index | ''data/lucene/index/'' (súbory Lucene, 1 segment), metadáta ''data/lucene/meta.json''. Bez databázy. |
+
+Kód pre Lucene je v ''lucene_index/'':
+
+^ Modul ^ Úloha ^
+| ''schema.py'' | Polia indexu, hodnoty polí z dokumentu, číselné podmienky dopytu. Čistý Python bez JVM, preto sa testuje aj lokálne. |
+| ''analysis.py'' | Štart JVM, analyzátory (''CustomAnalyzer'', ''PerFieldAnalyzerWrapper''), similarity (''BM25Similarity'', ''ClassicSimilarity''). |
+| ''build.py'' | ''IndexWriter'': dokumenty → Lucene dokumenty, ''forceMerge(1)'', štatistiky polí. |
+| ''search.py'' | ''LuceneSearchEngine'': parser dopytu, BM25F, filtre, triedenie, ''explain''; príkazový riadok aj interaktívny režim. |
+| ''compare.py'' | Porovnanie vlastného indexu a Lucene (kapitola 6), report ''data/reports/lucene_compare.*''. |
+
+===== 3. Návrh indexu =====
+
+==== 3.1 Analyzátor ====
+
+Textové polia analyzuje ''CustomAnalyzer'' zo štandardných komponentov Lucene. Napodobňuje vlastný tokenizer z 1. časti (''indexer/tokenizer.py''), aby sa indexy dali porovnať:
+
+^ Vlastný tokenizer (1. časť) ^ Komponent Lucene ^ Príklad ^
+| regex tokenov ''%%[a-z0-9]+([.\-/][a-z0-9]+)*%%'' | ''PatternTokenizer'' s tým istým regexom (Unicode písmená) | ''AK-47 rifles'' → ''AK-47'', ''rifles'' |
+| zložené tvary tokenu | ''WordDelimiterGraphFilter'' (preserveOriginal, catenateAll; „.“ je číslica) | ''ak-47'' → ''ak-47'', ''ak47'', ''ak'', ''47'' |
+| malé písmená, bez diakritiky | ''LowerCaseFilter'', ''ASCIIFoldingFilter'' | ''Škoda'' → ''skoda'' |
+| kaliber aj bez „mm“ | ''PatternCaptureGroupFilter'' ''%%^(\d+(?:\.\d+)?x\d+)mm$%%'' | ''7.62x39mm'' → ''7.62x39mm'', ''7.62x39'' |
+| stop slová (krátky zoznam, „light“, „heavy“, „main“ ostávajú) | ''StopFilter'' s tým istým zoznamom (''resources/stopwords.txt'', test kontroluje zhodu) | ''the'', ''of'' → vynechané |
+| S-stemmer (Harman, 1991) | ''EnglishMinimalStemFilter'' – je to ten istý S-stemmer | ''rifles'' → ''rifle'', ''batteries'' → ''battery'' |
+| – | ''FlattenGraphFilter'' (iba pri indexovaní; index neuloží graf tokenov) | |
+
+Kľúčové polia (''id'', ''category'', ''has_wiki'') majú ''KeywordTokenizer'' + ''LowerCaseFilter'': celá hodnota je jeden token. Bez toho by sa dopyt ''category:ships'' zmenil na ''ship'' a nenašiel by nič.
+
+==== 3.2 Polia a ich odôvodnenie ====
+
+Pole Lucene má typ podľa toho, ako sa v ňom hľadá:
+
+  * **text** (''TextField'') – analyzovaný text s pozíciami pre frázy a skóre BM25,
+  * **kľúčové slovo** (''StringField'') – presný filter,
+  * **číslo** (''IntPoint'' / ''DoublePoint'') – rozsah; navyše ''NumericDocValuesField'' / ''DoubleDocValuesField'' na triedenie a ''StoredField'' na zobrazenie,
+  * **uložené** (''StoredField'') – iba na zobrazenie výsledku.
+
+^ Polia ^ Typ Lucene ^ Dokumenty s hodnotou ^ Boost v predvolenom dopyte ^ Prečo ^
+| ''id'' | StringField, uložené | 3 711 | – | Presné vyhľadanie dokumentu (''id:armor-37''), ''explain'' pre jeden dokument. |
+| ''category'' | StringField, uložené | 3 711 | – | Filter ''category:armor''. Kľúčové slovo, lebo hodnota sa nemá stemovať ani deliť. |
+| ''has_wiki'' | StringField, uložené | 3 711 (2 756 ''true'') | – | Filter na dokumenty, ktoré join pripojil k Wikipédii. |
+| ''name'' | TextField | 3 711 | **3** | Najsilnejší signál – používateľ najčastejšie hľadá podľa názvu (''barrett m82''). |
+| ''type'', ''roles'', ''country'', ''caliber'' | TextField | 3 711 / 3 507 / 3 711 / 1 313 | **2** | Opisujú objekt: typ (''main battle tank''), úloha, krajina (kanonická aj pôvodná), kaliber. |
+| ''anchors'' | TextField | 349 | **2** | Anchor texty odkazov medzi stránkami MilitaryFactory (1. časť). |
+| ''wiki_names'' | TextField | 2 756 | **2** | Názov EN stránky, presmerovania, anchor texty Wikipédie, SK názov (Spark join). Prezývky a slovenské názvy. |
+| ''manufacturer'', ''operators'', ''site_categories'', ''summary'', ''armament'', ''variants'', ''ships_in_class'', ''specs'', ''text'' | TextField | 1 127 – 3 710 | 1 | Ďalší text stránky. Bez boostu, lebo je dlhý a menej presný. |
+| ''wiki_abstract'', ''wiki_wars'' | TextField | 2 756 / 1 093 | 1 | Úvod EN a SK článku; vojny z infoboxu. |
+| ''wiki_designer'', ''wiki_unit_cost'', ''wiki_number_built'', ''wiki_production_date'', ''wiki_service'', ''wiki_used_by'', ''wiki_laid_down'', ''wiki_launched'', ''wiki_commissioned'', ''wiki_decommissioned'', ''wiki_fate'', ''wiki_status'' | TextField | 292 – 1 411 | – (iba dopyt na pole) | Atribúty infoboxu z joinu. Nie sú v predvolenom dopyte (dátumy a čísla by pridali šum), ale sú dostupné cez pole: ''wiki_fate:sunk'', ''wiki_designer:kalashnikov''. |
+| ''year'' | IntPoint + NumericDocValues + Stored | 3 711 | – | Rozsah ''year:[1939 TO 1945]'' a triedenie ''--sort year''. Textové pole by porovnávalo lexikograficky. |
+| ''wiki_built'' | IntPoint + NumericDocValues + Stored | 1 109 | – | **Nové číslo z Wikipédie**: počet vyrobených kusov z ''number_built'' (regex: ''3,600+'' → 3600, ''1952-1955'' sa odmietne). Dopyt ''rifle wiki_built>=1000000''. |
+| ''wiki_inlinks_count'' | IntPoint + NumericDocValues + Stored | 2 749 | – | Popularita stránky (počet odkazov z iných článkov); triedenie. |
+| ''weight_kg'', ''length_m'', ''max_speed_kmh'', ''range_km'', ''engine_hp'', ''crew_count'', ''displacement_tons'', ''speed_kts'', ''effective_range_m'', ''muzzle_velocity_mps'' … (19 polí) | DoublePoint + DoubleDocValues + Stored | 210 – 2 379 | – | Čísla z regex extraktora (1. časť) v jednotných jednotkách. Rozsah ''weight_kg:[60000 TO *]'' a triedenie ''--sort weight_kg:desc''. |
+| ''display'' | StoredField | 3 711 | – | JSON polí pre riadok výsledku (názov, URL, krajina, rok, hlavné parametre, EN/SK stránka). Text sa neukladá, preto je index malý. |
+
+**Predvolené polia a boosty sú presne zóny a váhy vlastného indexu** (''ZONE_WEIGHTS''; test to kontroluje). Rozdiely vo výsledkoch teda nespôsobil iný výber polí, ale model skóre (kapitola 6).
+
+<code python>
+# lucene_index/build.py – jedna hodnota jedného poľa
+if kind == KIND_KEYWORD:
+    lucene_document.add(StringField(name, value, Field.Store.YES))
+elif kind == KIND_TEXT:
+    lucene_document.add(TextField(name, value, Field.Store.NO))
+elif kind == KIND_INT:
+    lucene_document.add(IntPoint(name, [int(value)]))               # rozsah
+    lucene_document.add(NumericDocValuesField(name, int(value)))    # triedenie
+    lucene_document.add(StoredField(name, int(value)))              # zobrazenie
+elif kind == KIND_FLOAT:
+    lucene_document.add(DoublePoint(name, [float(value)]))
+    lucene_document.add(DoubleDocValuesField(name, float(value)))
+    lucene_document.add(StoredField(name, float(value)))
+
+config = IndexWriterConfig(build_analyzer(for_index=True))       # PerFieldAnalyzerWrapper
+config.setSimilarity(BM25Similarity(1.2, 0.75))                  # rovnaké k1, b ako vlastný index
+writer = IndexWriter(FSDirectory.open(Paths.get(str(index_dir))), config)
+for document in documents:
+    writer.addDocument(make_lucene_document(document, anchor_texts_by_url.get(document["url"], [])))
+writer.forceMerge(1)
+</code>
+
+^ Index ^ Dokumenty ^ Termy ^ Veľkosť ^ Čas stavby ^
+| vlastný (''data/index'', 1. časť + ''--wiki'') | 3 711 | 106 160 | 37,4 MB | 11,6 s |
+| Lucene (''data/lucene/index'') | 3 711 | 205 121 (súčet za polia; ''text'' 72 395, ''wiki_abstract'' 27 030, ''name'' 8 438) | **9,2 MB** | **4,9 s** |
+
+Lucene index je menší: vlastný index ukladá postings s pozíciami ako text a tabuľku dokumentov ako JSON so všetkými poľami, Lucene ukladá postings a pozície v komprimovaných binárnych súboroch (delta kódovanie, slovník ako FST) a z dokumentu uloží iba JSON na zobrazenie. Termov je viac, lebo Lucene má slovník pre každé pole zvlášť.
+
+===== 4. Nový index v aplikácii =====
+
+Vyhľadávanie z 1. časti dostalo voľbu ''--engine'':
+
+<code bash>
+python -m indexer.search "barrett m82"                                  # vlastný index (1. časť)
+python -m indexer.search "tiger OR panther" --engine lucene             # Lucene index
+python -m indexer.search "\"main battle tank\" AND country:germany year>=1990" --engine lucene --top 5
+python -m indexer.search "category:armor weight_kg:[60000 TO *]" --engine lucene --sort weight_kg:desc
+python -m indexer.search "german submarine" --engine lucene --explain   # vysvetlenie skóre (Lucene Explanation)
+python -m tools.lucene search                                           # interaktívne: JVM sa spustí raz
+</code>
+
+Ak PyLucene nie je v lokálnom Pythone, aplikácia spustí Lucene vyhľadávanie v Docker kontajneri. Výsledky majú rovnaký formát ako pri vlastnom indexe:
+
+<code>
+=== lucene bm25 (fields) | query='"main battle tank" AND country:germany year>=1990' | match=any | total hits=5 | results shown=3
+    lucene query: +(+((name:"main battle tank")^3.0 (type:"main battle tank")^2.0 … (text:"main battle tank")^1.0) +country:germany) #year:[1990 TO 2147483647]
+  1. 24.5274  Rheinmetall KF51 (Panther)  [armor | Germany | 2027]  max_speed_kmh=105 weight_kg=59000 crew_count=3
+  2.  3.8424  PzH 2000 (Panzerhaubitze 2000)  [armor | Germany | 1998]  max_speed_kmh=60 weight_kg=55300 engine_hp=1000 crew_count=5
+       wiki: Panzerhaubitze 2000 | sk: Panzerhaubitze 2000
+  3.  3.6563  Schutzenpanzer Puma  [armor | Germany | 2013]  max_speed_kmh=70 weight_kg=34700 engine_hp=1100 crew_count=3
+</code>
+
+**Spracovanie dopytu** (''LuceneSearchEngine.parse''):
+
+  - **Číselné podmienky** sa oddelia regexom a stanú sa ''IntPoint'' / ''DoublePoint'' rozsahmi s ''Occur.FILTER'' (nemenia skóre; s „-“ alebo NOT ''MUST_NOT''). Klasický ''QueryParser'' by z ''year:[1939 TO 1945]'' urobil textový rozsah a nenašiel by nič. Funguje aj starý zápis z 1. časti: ''year>=1990'', ''year:1939..1945''.
+  - **Text** spracuje:
+    * ''MultiFieldQueryParser'' cez 18 predvolených polí s boostami. Plná syntax Lucene, „/“ vnútri slova (''f/a-18'') sa escapuje.
+    * Alebo **BM25F**: ''CombinedFieldQuery'' pre každý term, s tými istými poľami a váhami.
+  - **Predvolený režim ''auto''** použije BM25F pre obyčajné slová a parser, keď dopyt obsahuje syntax (''AND'', úvodzovky, ''~'', ''*'', ''pole:'' …). Kapitola 6 ukazuje, prečo.
+  - Neznáme pole (''foo:bar'') a chyba syntaxe vrátia krátku chybu, nie Java výnimku.
+
+<code python>
+def _parse_bm25f(self, text, match_mode):
+    builder = BooleanQuery.Builder()
+    for term in dict.fromkeys(self.analyze(text, main_only=True)):     # "ak-47", nie aj "ak47", "ak", "47"
+        combined = CombinedFieldQuery.Builder()
+        for name, boost in DEFAULT_FIELD_BOOSTS.items():               # name 3, type 2, ..., text 1
+            combined.addField(name, float(boost))
+        combined.addTerm(BytesRef(term))
+        builder.add(combined.build(), BooleanClause.Occur.SHOULD)
+    return builder.build()
+</code>
+
+===== 5. Typy dopytov =====
+
+Všetky typy fungujú v aplikácii (''--engine lucene''). Počty sú z ''python -m tools.lucene compare'' (''data/reports/lucene_compare.dokuwiki.txt'').
+
+^ Typ ^ Syntax ^ Trieda Lucene ^ Príklad ^ Výsledky ^ Top 3 ^
+| Term | slovo | ''TermQuery'' (BM25F: ''CombinedFieldQuery'') | ''%%abrams%%'' | 63 | M1 Abrams, M1 Grizzly CMV, M1 Assault Breacher Vehicle |
+| Boolean AND | ''AND'', ''+'' | ''BooleanQuery'' (MUST) | ''%%tiger AND tank%%'' | 73 | Panzer VIB Tiger II, Panzer VI / Tiger I, Panzerjager Tiger (P) |
+| Boolean OR | ''OR'' (predvolený) | ''BooleanQuery'' (SHOULD) | ''%%tiger OR panther%%'' | 125 | Panzer V / Panther, Tiger II, Tiger I |
+| Boolean NOT | ''NOT'', ''-'' | ''BooleanQuery'' (MUST_NOT) | ''%%submarine NOT country:germany%%'' | 993 | Alexander Nevsky (K-550), USS Ohio, CNS Type 092 |
+| Fráza | ''"…"'' | ''PhraseQuery'' | ''%%"main battle tank"%%'' | 270 | Type 74, Otokar Altay, T-80 |
+| Blízkosť | ''"…"~n'' | ''PhraseQuery'' so slop | ''%%"gas operated"~3%%'' | 359 | Vickers K, Colt Browning M1895, AR-15 |
+| Fuzzy | ''slovo~n'' | ''FuzzyQuery'' (Damerau-Levenshtein) | ''%%kalashnikof~1%%'' | 121 | Kalashnikov AK-15, AK-308, AK-19 |
+| Wildcard / prefix | ''*'', ''?'' | ''WildcardQuery'', ''PrefixQuery'' | ''%%panz*%%'' | 191 | Panzer I, Panzer II, Maus |
+| Regexp | ''/…/'' | ''RegexpQuery'' | ''%%name:/t-[0-9]{2}/%%'' | 35 | T-23, T-27, T-46 |
+| Rozsah (číslo) | ''[a TO b]'', ''{a TO b}'', ''>='' | ''IntPoint'' / ''DoublePoint'' range | ''%%category:armor weight_kg:[60000 TO *]%%'' | 44 | M1 Abrams, 240mm TAZ, Challenger 2 |
+| Rozsah + fráza | | | ''%%"main battle tank" year>=1990%%'' | 113 | Otokar Altay, NORINCO VT-4, Type 10 |
+| Rozsah (Wikipédia) | | ''IntPoint'' range | ''%%rifle wiki_built>=1000000%%'' | 62 | Arisaka Type 99, Berthier Rifle, Zastava M70 |
+| Dopyt na pole | ''pole:hodnota'' | ''TermQuery'' v poli | ''%%wiki_designer:kalashnikov%%'' | 24 | Type 68, AK-203, RPL-20 |
+| Boost | ''slovo^n'' | ''BoostQuery'' | ''%%panther^3 tank%%'' | 1 586 | Panzer V / Panther, K2 Black Panther, KF51 Panther |
+| Zoskupenie | ''( … )'' | vnorený ''BooleanQuery'' | ''%%(tiger OR panther) AND category:armor -country:germany%%'' | 68 | CM-11 Brave Tiger, K2 Black Panther, Advanced Tactics Panther |
+| Triedenie | ''--sort pole[:desc]'' | ''Sort'' + ''SortField'' (doc values) | ''%%category:armor%%'' ''--sort weight_kg:desc'' | 1 263 | Paris-Geschutz, Krupp K5, Maus |
+
+V aplikácii najviac používam: **Boolean** (filtre kategórie a krajiny s ''+''/''AND''), **frázu** (typy ako ''"main battle tank"''), **rozsah** (rok, hmotnosť, rýchlosť, počet kusov), **dopyt na pole** (atribúty Wikipédie) a **fuzzy** (preklepy v názvoch, napr. ''kalashnikof~1'').
+
+**Rozdiel v sémantike:** vo vlastnom indexe je ''pole:hodnota'' vždy povinný filter. V Lucene je to obyčajná klauzula s predvoleným OR, povinná je až s ''+'' alebo ''AND''. ''submarine wiki_fate:sunk year:1939..1945'' preto dá v Lucene 168 výsledkov (ponorky ALEBO potopené lode), ''+submarine +wiki_fate:sunk year:1939..1945'' dá **36** – rovnako ako vlastný index. Číselné podmienky sú v oboch indexoch filtre.
+
+===== 6. Porovnanie: starý vs. nový index =====
+
+==== 6.1 Typy dopytov ====
+
+^ Typ ^ Vlastný index (1. časť) ^ Lucene ^
+| Term, AND (''--match all''), OR (predvolený) | áno | áno, aj kombinované v jednom dopyte |
+| NOT | **nie**: „not“ je stop slovo a ''country:germany'' je povinný filter. ''submarine NOT country:germany'' dá 69 **nemeckých** ponoriek (Type 209, Type 205, Type VII) – opak. | áno: 993 výsledkov, top 3 nie sú nemecké |
+| Fráza | áno (pozičný index) | áno |
+| Blízkosť | nie (iba presná fráza: ''"gas operated"'' 29 výsledkov) | áno: ''"gas operated"~3'' 359 výsledkov |
+| Fuzzy, wildcard, regexp | nie (''kalashnikof'' aj ''panz*'' = 0 výsledkov) | áno (121 / 191 / 35) |
+| Rozsah čísel | áno, filter na tabuľke dokumentov (''weight_kg>=60000'' – 44, rovnako ako Lucene) | áno, ''IntPoint'' / ''DoublePoint'' (BKD strom) |
+| Boost, zátvorky | nie | áno |
+| Triedenie podľa čísla | nie | áno (doc values) |
+
+==== 6.2 Kvalita na 10 hodnotiacich dopytoch ====
+
+Dopyty a pravidlá relevancie sú tie isté ako v 1. a 3. konzultácii (''reports/search_eval.py''). Relevantné dokumenty určujú štruktúrované polia, nie text. Oba indexy majú rovnaké dokumenty, polia aj váhy. Varianty:
+
+  * ''own_bm25'' – vlastný index, BM25 nad tf váženou zónami (k1 = 1,2, b = 0,75),
+  * ''own_tfidf'' – vlastný index, tf-idf s klasickým idf,
+  * ''lucene_bm25'' – Lucene ''MultiFieldQueryParser'' + ''BM25Similarity(1.2, 0.75)'',
+  * ''lucene_bm25f'' – Lucene ''CombinedFieldQuery'' (BM25F),
+  * ''lucene_classic'' – Lucene ''ClassicSimilarity'' (tf-idf) s tým istým dopytom ako ''lucene_bm25''.
+
+^ Variant ^ MAP ^ priemer P@10 ^ priemer R@100 ^ priemer nDCG@10 ^
+| ''own_bm25'' | 0,808 | **0,680** | 0,934 | 0,876 |
+| ''own_tfidf'' | 0,491 | 0,530 | 0,852 | 0,597 |
+| ''lucene_bm25'' | 0,654 | 0,550 | 0,887 | 0,682 |
+| ''lucene_bm25f'' | **0,818** | **0,680** | **0,937** | **0,882** |
+| ''lucene_classic'' | 0,602 | 0,440 | 0,896 | 0,582 |
+
+^ Dopyt ^ Text ^ Relevantné ^ AP ''own_bm25'' ^ AP ''lucene_bm25'' ^ AP ''lucene_bm25f'' ^ Spoločné v top 10: own_bm25 a lucene_bm25 ^ … a lucene_bm25f ^
+| Q1 | ''7.62x39 assault rifle'' | 35 | 0,89 | 0,63 | **0,92** | 1 | 8 |
+| Q2 | ''main battle tank'' | 83 | 0,99 | 0,98 | 0,99 | 6 | 8 |
+| Q3 | ''aircraft carrier'' | 117 | 0,91 | 0,83 | 0,91 | 4 | 10 |
+| Q4 | ''german submarine world war 2'' | 11 | 0,66 | 0,66 | **0,72** | 7 | 9 |
+| Q5 | ''barrett m82'' | 1 | 1,00 | 1,00 | 1,00 | 7 | 10 |
+| Q6 | ''soviet self-propelled howitzer'' | 3 | 0,42 | 0,08 | 0,42 | 4 | 10 |
+| Q7 | ''japanese battleship'' | 11 | 1,00 | 1,00 | 1,00 | 10 | 10 |
+| Q8 | ''british submachine gun'' | 3 | 1,00 | 0,56 | 1,00 | 5 | 9 |
+| Q9 | ''.50 bmg sniper rifle'' | 28 | 0,81 | 0,58 | 0,81 | 2 | 10 |
+| Q10 | ''american destroyer'' | 60 | 0,39 | 0,22 | 0,40 | 2 | 10 |
+
+  * **BM25F v Lucene ≈ vlastný BM25:** v top 10 má v priemere 9,4 z 10 dokumentov spoločných a MAP je o 0,010 vyšší. Vlastný index počíta BM25 nad súčtom váh zón (''tf = Σ váha(z) · počet(t, z)'', jedna dĺžka dokumentu) – a to je presne model BM25F. Malé rozdiely: Lucene kóduje dĺžku dokumentu do 1 bajtu (norm) a počíta BM25F s dĺžkami polí.
+  * **''MultiFieldQueryParser'' je horší** (MAP 0,654), hlavne pri Q1, Q6, Q8, Q9, Q10 – vysvetlenie v 6.3.
+  * **Lucene ClassicSimilarity (0,602) je lepší ako vlastný tf-idf (0,491)**: Lucene normalizuje dĺžku každého poľa zvlášť (krátke pole ''name'' má veľkú váhu) a jeho idf ''1 + ln((N + 1) / (df + 1))'' tlmí veľmi časté termy.
+  * Top 5 pre Q8: ''own_bm25'' a ''lucene_bm25f'' – Sterling ✓, Lanchester ✓, STEN ✓, MP3008, AUSTEN; ''lucene_bm25'' – Sterling ✓, **M3A1 Grease Gun, M3 Grease Gun, M1 Thompson** (americké), STEN ✓.
+
+==== 6.3 Prečo je BM25 po poliach horší ako BM25F ====
+
+''MultiFieldQueryParser'' urobí z každého termu ''OR'' cez všetky polia a skóre sčíta: ''Σ_pole boost · BM25(term, pole)''. Každé pole má vlastnú saturáciu tf a vlastné idf. Častý term, ktorý je v mnohých poliach, tak dostane body z každého poľa. Rozklad skóre (Lucene ''explain'') pre Q8 ''british submachine gun'':
+
+^ Dokument ^ Režim ^ ''british'' ^ ''submachine'' ^ ''gun'' ^ Spolu ^
+| M3 (Grease Gun) – americký, nerelevantný | po poliach | 0 | 15,3 (4 polia) | **21,6 (9 polí)** | **36,9** |
+| Lanchester (SMG) – britský, relevantný | po poliach | 2,6 (2 polia) | 16,3 (5 polí) | 7,8 (5 polí) | 26,7 |
+| M3 (Grease Gun) | BM25F | 0 | 2,87 | 0,32 | 3,20 |
+| Lanchester (SMG) | BM25F | **1,33** | 2,80 | 0,31 | **4,44** |
+
+Slovo ''gun'' je v korpuse veľmi časté, ale v poli ''name'' je zriedkavé (vysoké idf v tomto poli). M3 má ''gun'' v 9 poliach a dostane za neho 21,6 bodu – viac ako Lanchester za všetky tri slová. BM25F najprv sčíta tf zo všetkých polí (s váhami), potom raz saturuje a použije jedno idf. ''gun'' má potom iba 0,32 bodu a rozhodne zriedkavé ''british''. Preto aplikácia používa BM25F pre obyčajné slová (režim ''auto'').
+
+==== 6.4 Rýchlosť ====
+
+Priemer jedného hodnotiaceho dopytu (top 10, 20 opakovaní, zahriaty index, jeden proces):
+
+^ Index ^ Čas dopytu ^ Poznámka ^
+| vlastný BM25 | 2,7 ms | postings sa čítajú z textového súboru (seek podľa offsetu) a parsujú v Pythone |
+| Lucene BM25 (po poliach) | 2,3 ms | 18 polí × term; Java, binárne postings |
+| Lucene BM25F | 2,1 ms | jeden ''CombinedFieldQuery'' na term |
+
+Pri 3 711 dokumentoch sú oba indexy rýchle. Lucene je rýchlejší aj napriek tomu, že každý dopyt prechádza cez JCC most Python → Java. Štart JVM s otvorením indexu trvá 0,75 s (celý príkaz aj so spustením Docker kontajnera 1,5 s), preto má Lucene vyhľadávanie interaktívny režim.
+
+===== 7. Testy =====
+
+  * ''python -m pytest'' (lokálne, bez JVM): **144 testov prechádza**. 111 z 1. časti a 3. konzultácie; 33 nových v ''tests/unit/test_lucene_schema.py'': predvolené polia = zóny vlastného indexu, zhodný zoznam stop slov, hodnoty polí, ''wiki_built'' z textu Wikipédie, číselné podmienky (''[a TO b]'', ''{a TO b}'', ''>='', ''a..b'', ''-'', ''NOT''), oprava operátorov po odstránení podmienky. Integračný test Lucene sa lokálne preskočí (PyLucene nie je nainštalovaný).
+  * ''python -m tools.lucene test'' (v kontajneri PyLucene): **42 testov prechádza** – 33 vyššie + 9 v ''tests/integration/test_lucene_index.py'' na malom indexe: analyzátor (''ak47'' nájde ''AK-47'', ''7.62x39'' nájde ''7.62x39mm''), Boolean, fráza a blízkosť, fuzzy a wildcard, rozsahy (aj ''wiki_built''), kľúčové polia, BM25F a režim ''auto'', triedenie, chyby (neznáme pole, syntax).
+  * Vlastný index po úprave ''indexer/build.py'' (spoločná funkcia ''load_index_documents'') je **bajtovo rovnaký** ako predtým (MD5 súborov ''dictionary.tsv'', ''postings.txt'', ''documents.jsonl'').
+
+===== 8. Spustenie =====
+
+<code bash>
+python -m indexer.build --wiki            # vlastný index (porovnanie potrebuje dáta z joinu)
+python -m tools.lucene build              # Lucene index (data/lucene/index), 5 s
+python -m tools.lucene compare            # porovnanie -> data/reports/lucene_compare.{json,dokuwiki.txt}
+python -m indexer.search "kalashnikof~1" --engine lucene
+python -m tools.lucene test               # testy Lucene v kontajneri
+</code>

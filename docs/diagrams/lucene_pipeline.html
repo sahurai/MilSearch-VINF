@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="sk">
+<head>
+<meta charset="utf-8">
+<title>MilSearch Lucene index</title>
+<!-- Source of docs/diagrams/milsearch_lucene_pipeline.png. Render: docs/diagrams/render.sh -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Kalam:wght@400;700&display=block" rel="stylesheet">
+<script src="https://unpkg.com/roughjs@4.6.6/bundled/rough.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #ffffff; }
+  svg { display: block; font-family: 'Kalam', cursive; }
+</style>
+</head>
+<body>
+<svg id="diagram" xmlns="http://www.w3.org/2000/svg" width="1640" height="800" viewBox="0 0 1640 800"></svg>
+<script>
+const SVG_NS = "http://www.w3.org/2000/svg";
+const svg = document.getElementById("diagram");
+const rc = rough.svg(svg, { options: { seed: 7, roughness: 1.1, strokeWidth: 1.6, bowing: 1 } });
+
+const COLORS = {
+  queue: "#ffd8a8",
+  compute: "#a5d8ff",
+  storage: "#b2f2bb",
+  external: "#e9ecef",
+  check: "#fcc2d7",
+  plan: "#d0bfff",
+  note: "#fff3bf",
+};
+const FILL = { fillStyle: "hachure", hachureGap: 7, fillWeight: 1.2 };
+
+// ---- Primitives ----------------------------------------------------------------
+function text(x, y, value, { size = 17, weight = 400, anchor = "middle", color = "#1e1e1e" } = {}) {
+  const element = document.createElementNS(SVG_NS, "text");
+  element.setAttribute("x", x);
+  element.setAttribute("y", y);
+  element.setAttribute("font-size", size);
+  element.setAttribute("font-weight", weight);
+  element.setAttribute("text-anchor", anchor);
+  element.setAttribute("fill", color);
+  element.textContent = value;
+  svg.appendChild(element);
+}
+
+function lines(cx, top, title, rows, { titleSize = 21, rowSize = 16.5, gap = 22 } = {}) {
+  text(cx, top, title, { size: titleSize, weight: 700 });
+  rows.forEach((row, index) => text(cx, top + 26 + index * gap, row, { size: rowSize }));
+}
+
+function box(x, y, w, h, fill, title, rows, options = {}) {
+  svg.appendChild(rc.rectangle(x, y, w, h, { fill, ...FILL, ...options }));
+  lines(x + w / 2, y + 32, title, rows);
+}
+
+function cylinder(x, y, w, h, fill, title, rows) {
+  const ry = 14;
+  svg.appendChild(rc.path(
+    `M ${x} ${y + ry} L ${x} ${y + h - ry} A ${w / 2} ${ry} 0 0 0 ${x + w} ${y + h - ry} L ${x + w} ${y + ry}`,
+    { fill, ...FILL },
+  ));
+  svg.appendChild(rc.ellipse(x + w / 2, y + ry, w, ry * 2, { fill, fillStyle: "solid" }));
+  lines(x + w / 2, y + ry * 2 + 26, title, rows, { titleSize: 19, rowSize: 15.5, gap: 20 });
+}
+
+function queue(x, y, w, h, fill, title, rows) {
+  svg.appendChild(rc.rectangle(x, y, w, h, { fill, ...FILL }));
+  lines(x + w / 2, y + 30, title, rows);
+  const slotCount = 6;
+  const slotWidth = 26;
+  const startX = x + (w - slotCount * slotWidth - (slotCount - 1) * 6) / 2;
+  for (let index = 0; index < slotCount; index += 1) {
+    svg.appendChild(rc.rectangle(startX + index * (slotWidth + 6), y + h - 38, slotWidth, 24,
+      { fill: "#ffffff", fillStyle: "solid" }));
+  }
+}
+
+function diamond(cx, cy, w, h, fill, title, rows) {
+  svg.appendChild(rc.polygon([[cx, cy - h / 2], [cx + w / 2, cy], [cx, cy + h / 2], [cx - w / 2, cy]],
+    { fill, ...FILL }));
+  lines(cx, cy - 6, title, rows, { titleSize: 18, rowSize: 15 });
+}
+
+function cloud(cx, cy, w, h, fill, title, rows) {
+  const left = cx - w / 2;
+  const top = cy - h / 2;
+  const d = [
+    `M ${left + w * 0.18} ${top + h * 0.85}`,
+    `C ${left - w * 0.05} ${top + h * 0.85}, ${left - w * 0.04} ${top + h * 0.42}, ${left + w * 0.16} ${top + h * 0.42}`,
+    `C ${left + w * 0.16} ${top + h * 0.05}, ${left + w * 0.5} ${top - h * 0.05}, ${left + w * 0.56} ${top + h * 0.22}`,
+    `C ${left + w * 0.7} ${top + h * 0.02}, ${left + w * 0.98} ${top + h * 0.12}, ${left + w * 0.9} ${top + h * 0.42}`,
+    `C ${left + w * 1.08} ${top + h * 0.5}, ${left + w * 1.04} ${top + h * 0.88}, ${left + w * 0.84} ${top + h * 0.85}`,
+    "Z",
+  ].join(" ");
+  svg.appendChild(rc.path(d, { fill, ...FILL }));
+  lines(cx, cy + 4, title, rows, { titleSize: 20, rowSize: 16 });
+}
+
+function arrow(points, { label = null, labelAt = null, dashed = false, anchor = "middle", both = false } = {}) {
+  const options = dashed ? { strokeLineDash: [8, 7], roughness: 0.8 } : { roughness: 0.8 };
+  svg.appendChild(rc.linearPath(points, options));
+  const head = (from, to) => {
+    const angle = Math.atan2(to[1] - from[1], to[0] - from[0]);
+    const size = 13;
+    const spread = Math.PI / 7;
+    svg.appendChild(rc.polygon([
+      to,
+      [to[0] - size * Math.cos(angle - spread), to[1] - size * Math.sin(angle - spread)],
+      [to[0] - size * Math.cos(angle + spread), to[1] - size * Math.sin(angle + spread)],
+    ], { fill: "#1e1e1e", fillStyle: "solid", roughness: 0.5 }));
+  };
+  head(points[points.length - 2], points[points.length - 1]);
+  if (both) head(points[1], points[0]);
+  if (label) {
+    const [lx, ly] = labelAt;
+    text(lx, ly, label, { size: 15.5, anchor, color: "#364fc7" });
+  }
+}
+
+
+
+// ---- Title ---------------------------------------------------------------------
+text(40, 52, "MilSearch – Lucene index (2. časť, konzultácia 4)", { size: 32, weight: 700, anchor: "start" });
+text(40, 80, "Docker coady/pylucene:10 · PyLucene 10.0.0 = Apache Lucene 10.0.0 · Python 3.15 · python -m tools.lucene build | search | compare | test",
+  { size: 18, anchor: "start", color: "#495057" });
+
+// ---- Inputs --------------------------------------------------------------------
+cylinder(40, 120, 230, 118, COLORS.external, "data/parsed", ["3 711 dokumentov (1. časť)"]);
+cylinder(40, 275, 230, 118, COLORS.external, "crawl/anchors.tsv", ["anchor texty MilitaryFactory"]);
+cylinder(40, 430, 230, 118, COLORS.external, "wiki/joined.jsonl", ["Spark join · 2 756 dokumentov", "EN + SK Wikipédia"]);
+
+box(320, 262, 270, 144, COLORS.compute, "load_index_documents", [
+  "indexer.build",
+  "rovnaké dokumenty",
+  "pre oba indexy",
+]);
+arrow([[270, 180], [295, 180], [295, 300], [318, 300]]);
+arrow([[270, 334], [318, 334]]);
+arrow([[270, 490], [295, 490], [295, 368], [318, 368]]);
+
+// ---- Own index -----------------------------------------------------------------
+box(650, 112, 290, 112, COLORS.compute, "indexer.build --wiki", ["vlastný index (1. časť)", "zóny s váhami, BM25"]);
+arrow([[455, 262], [455, 168], [648, 168]]);
+cylinder(1000, 108, 230, 120, COLORS.storage, "data/index", ["37,4 MB · 11,6 s", "106 160 termov"]);
+arrow([[940, 168], [998, 168]]);
+
+// ---- Lucene index ----------------------------------------------------------------
+box(650, 270, 290, 196, COLORS.plan, "lucene_index.build", [
+  "schema: 56 polí",
+  "CustomAnalyzer (ako tokenizer",
+  "z 1. časti) + PerFieldAnalyzer",
+  "IndexWriter · BM25(1.2, 0.75)",
+  "forceMerge(1)",
+]);
+arrow([[590, 334], [648, 334]]);
+cylinder(1000, 306, 230, 124, COLORS.storage, "data/lucene/index", ["9,2 MB · 4,9 s", "1 segment"]);
+arrow([[940, 368], [998, 368]]);
+
+box(650, 520, 290, 196, COLORS.note, "polia Lucene", [
+  "TextField: name^3 · type^2 · …",
+  "wiki_names^2 · text^1 (18 zón)",
+  "+ 12 atribútov Wikipédie",
+  "StringField: id · category",
+  "Int/DoublePoint: year · weight_kg",
+  "wiki_built · … (22 čísel)",
+]);
+arrow([[795, 520], [795, 468]], { dashed: true });
+
+// ---- Search ----------------------------------------------------------------------
+box(1300, 108, 300, 120, COLORS.compute, "indexer.search", ["aplikácia (príkazový riadok)", "--engine own | lucene"]);
+arrow([[1230, 168], [1298, 168]], { label: "own", labelAt: [1264, 156] });
+
+box(1300, 286, 300, 196, COLORS.compute, "lucene_index.search", [
+  "čísla → Point range (FILTER)",
+  "auto: slová → BM25F",
+  "(CombinedFieldQuery)",
+  "syntax → MultiFieldQueryParser",
+  "sort (doc values) · explain",
+]);
+arrow([[1230, 368], [1298, 368]]);
+arrow([[1450, 286], [1450, 230]], { label: "lucene (Docker)", labelAt: [1462, 262], anchor: "start" });
+
+// ---- Compare ---------------------------------------------------------------------
+box(1300, 540, 300, 176, COLORS.check, "lucene_index.compare", [
+  "10 dopytov · 5 variantov",
+  "MAP: vlastný BM25 0,808",
+  "Lucene BM25F 0,818",
+  "Lucene po poliach 0,654",
+  "15 typov dopytov",
+]);
+arrow([[1115, 430], [1115, 628], [1298, 628]]);
+arrow([[1250, 168], [1250, 600], [1298, 600]], { dashed: true });
+text(1450, 750, "data/reports/lucene_compare.json · .dokuwiki.txt", { size: 16, color: "#495057" });
+
+// ---- Legend --------------------------------------------------------------------
+const legend = [
+  [COLORS.external, "vstupné dáta (1. časť, Spark)"],
+  [COLORS.compute, "Python modul"],
+  [COLORS.plan, "Lucene index (PyLucene)"],
+  [COLORS.storage, "index na disku (bez DB)"],
+  [COLORS.check, "porovnanie"],
+];
+text(40, 612, "Legenda", { size: 18, weight: 700, anchor: "start" });
+legend.forEach(([fill, label], index) => {
+  const y = 628 + index * 24;
+  svg.appendChild(rc.rectangle(40, y, 26, 18, { fill, fillStyle: "solid", roughness: 0.6 }));
+  text(76, y + 15, label, { size: 16, anchor: "start" });
+});
+</script>
+</body>
+</html>

@@ -13,7 +13,7 @@ The data comes from two sources:
 
 Part 1 of the project: the crawler, the regex extractor, the own inverted index with ranked search, and the statistics and evaluation reports (sections 4–12).
 
-Part 2 of the project: distributed processing in Apache Spark, the Wikipedia dump (EN and SK) and the join of the MilitaryFactory documents with Wikipedia (section 13).
+Part 2 of the project: distributed processing in Apache Spark, the Wikipedia dump (EN and SK) and the join of the MilitaryFactory documents with Wikipedia (section 13), and a second index in PyLucene (section 14).
 
 > Course: Information Retrieval (VINF), FIIT STU Bratislava, 2026.
 > The documentation in this repository uses ASD-STE100 Simplified Technical English.
@@ -38,6 +38,12 @@ For the Spark jobs (part 2), you also need Docker and the image of the course `i
 
 ```bash
 docker pull iisas/hadoop-spark-pig-hive:2.9.2
+```
+
+For the Lucene index (part 2, section 14), you also need the Docker image `coady/pylucene:10` (PyLucene 10.0.0 = Apache Lucene 10.0.0, Python 3.15, Java). The image of the course does not contain PyLucene.
+
+```bash
+docker pull coady/pylucene:10
 ```
 
 ## 2. Installation
@@ -436,7 +442,7 @@ The crawler identifies itself in the `User-Agent` header. It does not show itsel
    python -m pytest tests/integration
    ```
 
-The project has 111 tests (73 for part 1, 38 for part 2). The tests do not send HTTP requests and do not need Spark. Each bug fix has a regression test. The test `tests/unit/test_extractor_pages.py` runs the extractor on 20 real pages (7 small arms, 7 armor, 6 ships) and compares the result with hand-checked values.
+In the local virtual environment, pytest runs 144 tests: 73 for part 1, 38 for the Spark and Wikipedia code and 33 for the Lucene schema. The tests do not send HTTP requests and do not need Spark. pytest skips `tests/integration/test_lucene_index.py` because it needs PyLucene. Run the Lucene tests (42: the schema tests and 9 index tests) in the PyLucene container with `python -m tools.lucene test`. Each bug fix has a regression test. The test `tests/unit/test_extractor_pages.py` runs the extractor on 20 real pages (7 small arms, 7 armor, 6 ships) and compares the result with hand-checked values.
 
 ## 11. Code conventions
 
@@ -549,3 +555,65 @@ The reports are in `data/reports/spark_extract.*`, `wiki_pages_en.*`, `wiki_page
 - The military pre-filter (infobox or category) is broad: it also marks some pages about people (categories such as "... Artillery Branch personnel"). The score of the join removes them.
 - 955 documents have no join result: the object has no English article, Wikipedia uses a very different name (`Carro Armato L3` → `L3/35`), or no year confirms a weak name match. The rules prefer precision to recall.
 - The Slovak Wikipedia has few military articles: 292 of the 2,575 joined English pages have a Slovak version.
+
+## 14. Part 2: Lucene index
+
+### 14.1 Commands
+
+| Step | Command | Output |
+|------|---------|--------|
+| 1 | `python -m indexer.build --wiki` | `data/index/` (own index; the comparison needs the Wikipedia data) |
+| 2 | `python -m tools.lucene build` | `data/lucene/index/` (Lucene files, 1 segment), `data/lucene/meta.json` |
+| 3 | `python -m indexer.search "<query>" --engine lucene` | ranked results from the Lucene index |
+| 4 | `python -m tools.lucene search` | interactive search (the JVM starts one time) |
+| 5 | `python -m tools.lucene compare` | `data/reports/lucene_compare.json`, `data/reports/lucene_compare.dokuwiki.txt` |
+| 6 | `python -m tools.lucene test` | Lucene tests in the container |
+
+`tools/lucene.py` runs `python -m lucene_index.<module>` in the container `coady/pylucene:10` with the project mounted at `/app`. When PyLucene is not in the local Python, `indexer.search --engine lucene` uses this launcher.
+
+### 14.2 Index design
+
+- The Lucene index and the own index get the same documents from `indexer.build.load_index_documents`: the extracted documents, the MilitaryFactory anchor texts and the Wikipedia fields of the Spark join.
+- The text analyzer (`lucene_index/analysis.py`) is a `CustomAnalyzer` that copies the own tokenizer: `PatternTokenizer` with the same token pattern, `WordDelimiterGraphFilter` (`ak-47` → `ak-47`, `ak47`, `ak`, `47`), `LowerCaseFilter`, `ASCIIFoldingFilter`, `PatternCaptureGroupFilter` (`7.62x39mm` → also `7.62x39`), `StopFilter` with the same stop words (`lucene_index/resources/stopwords.txt`) and `EnglishMinimalStemFilter` (the same S-stemmer). The keyword fields use `KeywordTokenizer` + `LowerCaseFilter`.
+- Fields (`lucene_index/schema.py`, 56 fields):
+
+| Kind | Lucene classes | Fields | Use |
+|------|----------------|--------|-----|
+| text | `TextField` | the 18 zones of the own index (`name`, `type`, ..., `wiki_names`, `wiki_abstract`, `text`), 12 Wikipedia attributes (`wiki_designer`, `wiki_fate`, ...) | full-text search; the zones are the default fields with the zone weights as boosts |
+| keyword | `StringField` | `id`, `category`, `has_wiki` | exact filters |
+| int | `IntPoint`, `NumericDocValuesField`, `StoredField` | `year`, `wiki_built` (number built from Wikipedia), `wiki_inlinks_count` | range queries, sorting |
+| float | `DoublePoint`, `DoubleDocValuesField`, `StoredField` | 19 extracted numbers (`weight_kg`, `max_speed_kmh`, `displacement_tons`, ...) | range queries, sorting |
+| stored | `StoredField` | `display` (JSON of the result line) | result display |
+
+### 14.3 Query processing
+
+1. Numeric conditions (`year:[1939 TO 1945]`, `weight_kg:{50000 TO *]`, `year>=1990`, `year:1939..1945`) become `IntPoint` or `DoublePoint` range queries with `Occur.FILTER` (`MUST_NOT` after `-` or `NOT`).
+2. The text goes to `MultiFieldQueryParser` (Lucene query syntax) or to BM25F (`CombinedFieldQuery` over the same fields and weights). The default `--scoring auto` uses BM25F for plain words and the parser for a query with the Lucene syntax.
+3. Options: `--top N`, `--match any|all` (default operator), `--similarity bm25|classic`, `--scoring auto|fields|bm25f`, `--sort field[:desc]`, `--explain`.
+
+Query types: Boolean (`AND`, `OR`, `NOT`, `+`, `-`), phrase, proximity (`"gas operated"~3`), fuzzy (`kalashnikof~1`), wildcard and prefix (`panz*`), regexp (`name:/t-[0-9]{2}/`), numeric range, field query (`wiki_designer:kalashnikov`), boost (`panther^3`), grouping, sorting by a numeric field.
+
+In the own index, `field:value` is always a required filter. In Lucene it is a normal clause (default operator OR); use `+field:value` or `AND` to make it required.
+
+### 14.4 Current results
+
+| Index | Terms | Size | Build time | Query time (top 10) |
+|-------|-------|------|------------|---------------------|
+| own (`data/index`) | 106,160 | 37.4 MB | 11.6 s | 2.7 ms |
+| Lucene (`data/lucene/index`) | 205,121 (sum over the fields) | 9.2 MB | 4.9 s | 2.3 ms (fields), 2.1 ms (BM25F) |
+
+| Variant (10 evaluation queries) | MAP | P@10 | R@100 | nDCG@10 |
+|---------------------------------|-----|------|-------|---------|
+| own BM25 | 0.808 | 0.680 | 0.934 | 0.876 |
+| own tf-idf | 0.491 | 0.530 | 0.852 | 0.597 |
+| Lucene BM25, `MultiFieldQueryParser` | 0.654 | 0.550 | 0.887 | 0.682 |
+| Lucene BM25F, `CombinedFieldQuery` | 0.818 | 0.680 | 0.937 | 0.882 |
+| Lucene `ClassicSimilarity` | 0.602 | 0.440 | 0.896 | 0.582 |
+
+The own BM25 uses the sum of the zone-weighted term frequencies with one document length. This is the BM25F model, so the own index and Lucene BM25F give almost the same ranking (9.4 of the top 10 documents are the same). `MultiFieldQueryParser` adds a separate BM25 score for each field: a frequent term that is in many fields (`gun`) gets more points than a rare term in one field (`british`).
+
+### 14.5 Known limitations of the Lucene index
+
+- PyLucene runs only in Docker on this computer. One command starts a container and the JVM (approximately 1.5 s); the interactive mode starts them one time.
+- The BM25F scoring takes plain words only. A query with the Lucene syntax uses the multi-field parser.
+- The analyzer is English. The Slovak Wikipedia title and abstract use the same analyzer (no Slovak stemming).

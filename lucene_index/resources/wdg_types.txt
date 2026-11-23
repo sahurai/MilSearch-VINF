@@ -1,0 +1,2 @@
+# WordDelimiterGraphFilter: "." is a decimal point (7.62x39mm), not a word separator.
+. => DIGIT

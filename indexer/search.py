@@ -23,13 +23,16 @@
 #     python -m indexer.search "barrett m82" --method tfidf --top 5
 #     python -m indexer.search "submarine country:germany year:1939..1945" --method all
 #     python -m indexer.search "assault rifle" --match all
+#     python -m indexer.search "tiger OR panther" --engine lucene   # Lucene index (part 2, lucene_index/)
 # ==============================================================================
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import logging
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -53,6 +56,10 @@ logger = logging.getLogger("indexer.search")
 
 MATCH_ANY = "any"
 MATCH_ALL = "all"
+
+ENGINE_OWN = "own"        # Own inverted index (data/index).
+ENGINE_LUCENE = "lucene"  # Lucene index (data/lucene/index); PyLucene runs in Docker.
+_ENGINE_OPTION = "--engine"
 
 # Fields that the result line shows for each category.
 _DISPLAY_FIELDS: dict[str, tuple[str, ...]] = {
@@ -124,7 +131,7 @@ def _has_phrase(position_lists: list[list[int]]) -> bool:
     )
 
 
-def _format_hit(hit: SearchHit) -> str:
+def format_hit(hit: SearchHit) -> str:
     """
     Make the result line of one hit.
 
@@ -306,20 +313,74 @@ class SearchEngine:
 # ENTRY POINT
 # ==============================================================================
 
+def _pop_engine(argv: list[str]) -> tuple[str, list[str]]:
+    """
+    Take the --engine option out of the command line arguments.
+
+    Steps:
+        1. Find "--engine NAME" or "--engine=NAME"; remove it from the arguments.
+
+    Returns:
+        (engine name, other arguments).
+    """
+    # 1. Find "--engine NAME" or "--engine=NAME"; remove it from the arguments
+    rest: list[str] = []
+    engine = ENGINE_OWN
+    items = iter(argv)
+    for item in items:
+        if item == _ENGINE_OPTION:
+            engine = next(items, ENGINE_OWN)
+        elif item.startswith(_ENGINE_OPTION + "="):
+            engine = item.split("=", 1)[1]
+        else:
+            rest.append(item)
+    return engine, rest
+
+
+def run_lucene_search(argv: list[str]) -> int:
+    """
+    Run the Lucene search with the given arguments.
+
+    Steps:
+        1. With PyLucene in this Python (in the container), run the Lucene search directly.
+        2. Otherwise, run it in the PyLucene Docker container.
+
+    Returns:
+        Exit code.
+    """
+    # 1. With PyLucene in this Python (in the container), run the Lucene search directly
+    if importlib.util.find_spec("lucene") is not None:
+        from lucene_index.search import main as lucene_main
+        lucene_main(argv)
+        return 0
+
+    # 2. Otherwise, run it in the PyLucene Docker container
+    from tools.lucene import run_module
+    return run_module("lucene_index.search", argv)
+
+
 def main() -> None:
     """
     Run one query from the command line and show the ranked results.
 
     Steps:
-        1. Read the options and configure the logging (plain output lines).
-        2. Load the index; stop with a short message when the index is missing.
-        3. Run the query with each selected method and show the results;
+        1. With --engine lucene, run the Lucene search (Lucene query syntax and options).
+        2. Read the options and configure the logging (plain output lines).
+        3. Load the index; stop with a short message when the index is missing.
+        4. Run the query with each selected method and show the results;
            stop with a short message when the query has an unknown filter field.
 
     Returns:
         None.
     """
-    # 1. Read the options and configure the logging (plain output lines)
+    # 1. With --engine lucene, run the Lucene search (Lucene query syntax and options)
+    engine_name, argv = _pop_engine(sys.argv[1:])
+    if engine_name == ENGINE_LUCENE:
+        sys.exit(run_lucene_search(argv))
+    if engine_name != ENGINE_OWN:
+        sys.exit(f"unknown engine: {engine_name} (use {ENGINE_OWN} or {ENGINE_LUCENE})")
+
+    # 2. Read the options and configure the logging (plain output lines)
     parser = argparse.ArgumentParser(description="MilSearch – search the MilitaryFactory index")
     parser.add_argument("query")
     parser.add_argument("--method", choices=(*METHODS, "all"), default=METHOD_BM25)
@@ -328,13 +389,13 @@ def main() -> None:
     arguments = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    # 2. Load the index; stop with a short message when the index is missing
+    # 3. Load the index; stop with a short message when the index is missing
     try:
         engine = SearchEngine()
     except FileNotFoundError:
         parser.error(f"no index in {INDEX_DIR}; run 'python -m indexer.build' first")
 
-    # 3. Run the query with each selected method and show the results;
+    # 4. Run the query with each selected method and show the results;
     #    stop with a short message when the query has an unknown filter field
     methods = METHODS if arguments.method == "all" else (arguments.method,)
     for method in methods:
@@ -344,7 +405,7 @@ def main() -> None:
             parser.error(str(error))
         logger.info("\n=== %s | query=%r | match=%s | results shown=%d", method, arguments.query, arguments.match, len(hits))
         for hit in hits:
-            logger.info(_format_hit(hit))
+            logger.info(format_hit(hit))
 
 
 if __name__ == "__main__":

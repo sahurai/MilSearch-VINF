@@ -195,7 +195,32 @@ def _load_wiki_fields(path: Path) -> dict[str, Document]:
     return fields_by_id
 
 
-def _get_zone_text(document: Document, zone: str, anchor_texts: list[str]) -> str:
+def load_index_documents(with_wiki: bool) -> tuple[list[Document], dict[str, list[str]], int]:
+    """
+    Load the documents of the index: the extracted documents, their anchor texts and the Wikipedia fields.
+
+    The own index (this module) and the Lucene index (lucene_index.build) use this function,
+    so that both indexes contain the same documents with the same text.
+
+    Steps:
+        1. Load the documents of all categories and the anchor texts.
+        2. With the Wikipedia data, add the fields of the join to each joined document.
+
+    Returns:
+        (documents, anchor texts by target URL, number of documents with Wikipedia fields).
+    """
+    # 1. Load the documents of all categories and the anchor texts
+    documents = _load_documents(CATEGORIES)
+    anchor_texts_by_url = _load_anchor_texts(ANCHORS_PATH)
+
+    # 2. With the Wikipedia data, add the fields of the join to each joined document
+    wiki_fields_by_id = _load_wiki_fields(WIKI_JOINED_PATH) if with_wiki else {}
+    for document in documents:
+        document.update(wiki_fields_by_id.get(document["id"], {}))
+    return documents, anchor_texts_by_url, len(wiki_fields_by_id)
+
+
+def get_zone_text(document: Document, zone: str, anchor_texts: list[str]) -> str:
     """
     Get the text of one zone of a document.
 
@@ -243,7 +268,7 @@ def index_document(document: Document, anchor_texts: list[str]) -> dict[str, tup
 
     # 1. Go through the zones in a fixed order
     for zone, weight in ZONE_WEIGHTS.items():
-        groups = get_term_groups(_get_zone_text(document, zone, anchor_texts))
+        groups = get_term_groups(get_zone_text(document, zone, anchor_texts))
 
         # 2. Add the zone weight to the tf of each term and keep the term position
         for group in groups:
@@ -347,13 +372,9 @@ def main() -> None:
     started_at = time.monotonic()
 
     # 1. Load the documents and the anchor texts; with --wiki, add the Wikipedia fields
-    documents = _load_documents(CATEGORIES)
-    anchor_texts_by_url = _load_anchor_texts(ANCHORS_PATH)
-    wiki_fields_by_id = _load_wiki_fields(WIKI_JOINED_PATH) if arguments.wiki else {}
-    for document in documents:
-        document.update(wiki_fields_by_id.get(document["id"], {}))
+    documents, anchor_texts_by_url, wiki_documents_count = load_index_documents(arguments.wiki)
     logger.info("STARTED index | documents_count=%d anchor_targets_count=%d wiki_documents_count=%d",
-                len(documents), len(anchor_texts_by_url), len(wiki_fields_by_id))
+                len(documents), len(anchor_texts_by_url), wiki_documents_count)
 
     # 2. Build the postings and the document table
     postings, rows = build_index(documents, anchor_texts_by_url)
@@ -367,7 +388,7 @@ def main() -> None:
         "positions_count": sum(len(positions) for postings_list in postings.values() for *_, positions in postings_list),
         "avg_length": sum(row["length"] for row in rows) / len(rows) if rows else 0.0,
         "zone_weights": ZONE_WEIGHTS,
-        "wiki_documents_count": len(wiki_fields_by_id),
+        "wiki_documents_count": wiki_documents_count,
         "built_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     save_index(postings, rows, meta, INDEX_DIR)
